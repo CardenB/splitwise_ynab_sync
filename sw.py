@@ -2,6 +2,7 @@ from splitwise import Splitwise
 from splitwise.expense import Expense
 from splitwise.user import ExpenseUser
 import os
+import logging
 from utils import setup_environment_vars
 
 # https://github.com/namaggarwal/splitwise
