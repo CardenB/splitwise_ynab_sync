@@ -33,4 +33,5 @@ jobs:
         ynab_personal_access_token: ${{ secrets.ynab_personal_access_token }}
         ynab_budget_name: ${{ vars.ynab_budget_name }}
         ynab_account_name: ${{ vars.ynab_account_name }}
+        sync_update_date: ${{ vars.sync_update_date }}
       run: python main.py
