@@ -34,4 +34,5 @@ jobs:
         ynab_budget_name: ${{ vars.ynab_budget_name }}
         ynab_account_name: ${{ vars.ynab_account_name }}
         sync_update_date: ${{ vars.sync_update_date }}
+        sync_ynab_to_sw: ${{ vars.sync_ynab_to_sw }}
       run: python main.py
