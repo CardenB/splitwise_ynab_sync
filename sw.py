@@ -14,6 +14,7 @@ class SW():
         self.limit = 100
         self.current_user = self.sw.getCurrentUser().getFirstName()
         self.current_user_id = self.sw.getCurrentUser().getId()
+        self.logger = logging.getLogger(__name__)
 
     def get_friends(self):
         friends_fullnames = []
@@ -29,7 +30,9 @@ class SW():
 
     def get_expenses(self, dated_before=None, dated_after=None, use_update: bool=False):
         # get all expenses between 2 dates
+        self.logger.info(f"Getting all expenses updated between {dated_after} and {dated_before}")
         if use_update:
+            self.logger.info("Using updated_at instead of expense date for finding expenses.")
             expenses = self.sw.getExpenses(limit=self.limit, updated_before=dated_before, updated_after=dated_after)
         else:
             expenses = self.sw.getExpenses(limit=self.limit, dated_before=dated_before, dated_after=dated_after)
