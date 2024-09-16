@@ -182,6 +182,8 @@ if __name__=="__main__":
     # Config Options
     use_update_date = os.environ.get('sync_update_date', 'false').lower() == 'true'
     sync_ynab_to_sw = os.environ.get('sync_ynab_to_sw', 'true').lower() == 'true'
+    from pprint import pprint
+    pprint(os.environ)
 
     a = ynab_splitwise_transfer(sw_consumer_key, sw_consumer_secret,
                                 sw_api_key, ynab_personal_access_token,
