@@ -41,13 +41,39 @@ class ynab_splitwise_transfer():
                 # don't import deleted expenses
                 if expense['deleted_time']:
                     continue
-                transaction = {
-                                "account_id": self.ynab_account_id,
-                                "date":expense['date'],
-                                "amount":-int(expense['owed']*1000),
-                                "memo":" ".join([expense['description'].strip() ,"with", combine_names(expense['users'])]),
-                                "cleared": "cleared"
-                            }
+                total_cost = -int(expense['cost']*1000)
+                what_i_paid = -(int(expense['cost']*1000)-int(expense['owed']*1000))
+                what_i_am_owed = int(expense['owed']*1000)
+                if expense['current_user_paid']:
+                    transaction = {
+                        "account_id": self.ynab_account_id,
+                        "date":expense['date'],
+                        "amount": what_i_am_owed,
+                        "payee_name": expense['group_name'] if expense['group_name'] else "Splitwise",
+                        "memo": f"{expense['description']}",
+                        "cleared": "cleared",
+                    }
+                else:
+                    transaction = {
+                        "account_id": self.ynab_account_id,
+                        "date":expense['date'],
+                        "amount": what_i_paid,
+                        "payee_name": expense['group_name'] if expense['group_name'] else "Splitwise",
+                        "subtransactions": [
+                            {
+                                "amount": total_cost,
+                                "payee_name": expense['description'],
+                                "memo": "Total Cost"
+                            },
+                            {
+                                "amount": int(expense['owed']*1000),
+                                "payee_name":combine_names(expense['users']),
+                                "memo": "What others owe."
+                            },
+                        ],
+                        "memo":" ".join([expense['description'].strip() ,"with", combine_names(expense['users'])]),
+                        "cleared": "cleared"
+                    }
                 ynab_transactions.append(transaction)
             # export to ynab
             if ynab_transactions:
@@ -182,8 +208,6 @@ if __name__=="__main__":
     # Config Options
     use_update_date = os.environ.get('sync_update_date', 'false').lower() == 'true'
     sync_ynab_to_sw = os.environ.get('sync_ynab_to_sw', 'true').lower() == 'true'
-    from pprint import pprint
-    pprint(os.environ)
 
     a = ynab_splitwise_transfer(sw_consumer_key, sw_consumer_secret,
                                 sw_api_key, ynab_personal_access_token,

@@ -13,7 +13,7 @@ class SW():
         self.sw = Splitwise(consumer_key, consumer_secret, api_key=api_key)
 
         self.limit = 100
-        self.current_user = self.sw.getCurrentUser().getFirstName()
+        self.current_user = f"{self.sw.getCurrentUser().getFirstName()} {self.sw.getCurrentUser().getLastName()} - {self.sw.getCurrentUser().getId()}"
         self.current_user_id = self.sw.getCurrentUser().getId()
         self.logger = logging.getLogger(__name__)
 
@@ -39,35 +39,48 @@ class SW():
             expenses = self.sw.getExpenses(limit=self.limit, dated_before=dated_before, dated_after=dated_after)
         owed_expenses = []
         for expense in expenses:
+            # How do I treat "payments"?
+            if expense.payment:
+                continue
             owed_expense = {}
             users = expense.getUsers()
             user_names = []
             expense_cost = float(expense.getCost())
-            is_append = False
+            what_other_users_paid = 0.0
+            owed_expense['cost'] = expense_cost
+            owed_expense['description'] = expense.getDescription()
 
+            # Determine if the current use paid first.
+            current_user_paid = False
             for user in users:
-                user_first_name = user.getFirstName()
-                if user_first_name == self.current_user:
-                    paid = float(user.getPaidShare())
-                    description = expense.getDescription()
-                    if paid == 0 and description.strip() != 'Payment':
-                        owed_expense['owed'] = float(user.getOwedShare())
-                        owed_expense['date'] = expense.getDate()
-                        owed_expense['created_time'] = expense.getCreatedAt()
-                        owed_expense['updated_time'] = expense.getUpdatedAt()
-                        owed_expense['deleted_time'] = expense.getDeletedAt()
-                        owed_expense['description'] = description
-                        owed_expense['cost'] = expense_cost
-                        is_append = True
+                user_first_last_name = f"{user.getFirstName()} {user.getLastName()} - {user.getId()}"
+                if float(user.getPaidShare()) == expense_cost:
+                    current_user_paid = user_first_last_name == self.current_user
+            owed_expense['current_user_paid'] = current_user_paid
+            group_name = ''
+            if expense.getGroupId() > 0:
+                group = self.sw.getGroup(id=expense.getGroupId())
+                group_name = group.getName()
+            owed_expense['group_name'] = group_name
+            for user in users:
+                user_first_last_name = f"{user.getFirstName()} {user.getLastName()} - {user.getId()}"
+
+                if user_first_last_name == self.current_user:
+                    # When a user split expenses with others, the user paid the full amount and they "owe" the amount
+                    # they actually were supposed to pay.
+                    paid = float(user.getOwedShare())
+                    owed_expense['owed'] = expense_cost - paid
+                    owed_expense['date'] = expense.getDate()
+                    owed_expense['created_time'] = expense.getCreatedAt()
+                    owed_expense['updated_time'] = expense.getUpdatedAt()
+                    owed_expense['deleted_time'] = expense.getDeletedAt()
                 else:       # get user names other than current_user
-                    paid_share = float(user.getPaidShare())
-                    if paid_share == expense_cost:
-                        user_names.append("[" + user_first_name + "]")
-                    else:
-                        user_names.append(user_first_name)
-            if is_append:      # check category instead of description
-                owed_expense['users'] = user_names
-                owed_expenses.append(owed_expense)
+                    # If the user paid the expense cost, then they are owed.
+                    user_names.append(f"{user.getFirstName()} {user.getLastName()}")
+                    what_other_users_paid += float(user.getOwedShare())
+            # Make a string list for passing around jsons.
+            owed_expense['users'] = user_names
+            owed_expenses.append(owed_expense)
         return owed_expenses
     
     def create_expense(self, expense):
