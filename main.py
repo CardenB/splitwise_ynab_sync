@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from sw import SW
 from ynab import YNABClient
-from utils import setup_environment_vars, combine_names
+from utils import setup_environment_vars, combine_names, extract_swid_from_memo
 
 class ynab_splitwise_transfer():
     def __init__(self, sw_consumer_key, sw_consumer_secret,sw_api_key, 
@@ -21,11 +21,34 @@ class ynab_splitwise_transfer():
 
         # timestamps
         now = datetime.now(timezone.utc)
-        self.end_date = datetime(now.year, now.month, now.day)
+        self.end_date = datetime(now.year, now.month, now.day) + timedelta(days=1)
         self.sw_start_date = self.end_date - timedelta(days=1)
         self.ynab_start_date = self.end_date - timedelta(days=7)
 
         self.use_update_date = use_update_date
+
+    def get_swids_in_ynab(self):
+        """
+        Gets all Splitwise expense IDs from YNAB transactions in the splitwise account.
+        WARNING: Will process ALL transactions in the Splitwise account. Hopefully rate limits will not become an issue.
+
+        This is used to determine if the splitwise transaction is already added so it will not be added again.
+
+        Returns:
+        Set of all Splitwise expense IDs in YNAB transactions.
+        """
+        # TODO(carden): Account for created/updated date being different than transaction date.
+        ynab_splitwise_transactions_response = self.ynab.get_transactions(self.ynab_budget_id, self.ynab_account_id)
+        splitwise_expense_ids = set()
+        for transaction in ynab_splitwise_transactions_response.get('data', {}).get('transactions', []):
+            # check the memo for 'splitwise' keyword
+            memo = transaction.get('memo', '')
+            if not memo:
+                continue
+            sw_id, _, _ = extract_swid_from_memo(memo)
+            if sw_id is not None:
+                splitwise_expense_ids.add(sw_id)
+        return splitwise_expense_ids
 
     def sw_to_ynab(self):
         self.logger.info("Moving transactions from Splitwise to YNAB...")
@@ -34,6 +57,7 @@ class ynab_splitwise_transfer():
                                         dated_before=self.end_date,
                                         use_update=self.use_update_date)
 
+        swids_in_ynab = self.get_swids_in_ynab()
         if expenses:
             # process
             ynab_transactions = []
@@ -41,6 +65,11 @@ class ynab_splitwise_transfer():
                 # don't import deleted expenses
                 if expense['deleted_time']:
                     continue
+                if expense.get('swid', ''):
+                    # Check if the expense is already in YNAB
+                    if expense['swid'] in swids_in_ynab:
+                        self.logger.info(f"Skipping Splitwise expense {expense['date']} {expense['description']} {expense['swid']} as it is already in YNAB.")
+                        continue
                 total_cost = -int(expense['cost']*1000)
                 what_i_paid = -(int(expense['cost']*1000)-int(expense['owed']*1000))
                 what_i_am_owed = int(expense['owed']*1000)
@@ -74,6 +103,8 @@ class ynab_splitwise_transfer():
                         "memo":" ".join([expense['description'].strip() ,"with", combine_names(expense['users'])]),
                         "cleared": "uncleared"
                     }
+                if expense.get('swid', ''):
+                    transaction['memo'] = f"{transaction['memo']} {expense['swid']}]"
                 ynab_transactions.append(transaction)
             # export to ynab
             if ynab_transactions:
