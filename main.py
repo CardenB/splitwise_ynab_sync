@@ -51,7 +51,7 @@ class ynab_splitwise_transfer():
                         "amount": what_i_am_owed,
                         "payee_name": expense['group_name'] if expense['group_name'] else "Splitwise",
                         "memo": f"{expense['description']}",
-                        "cleared": "cleared",
+                        "cleared": "uncleared",
                     }
                 else:
                     transaction = {
@@ -72,7 +72,7 @@ class ynab_splitwise_transfer():
                             },
                         ],
                         "memo":" ".join([expense['description'].strip() ,"with", combine_names(expense['users'])]),
-                        "cleared": "cleared"
+                        "cleared": "uncleared"
                     }
                 ynab_transactions.append(transaction)
             # export to ynab
