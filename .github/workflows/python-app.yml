@@ -35,4 +35,5 @@ jobs:
         ynab_account_name: ${{ vars.ynab_account_name }}
         sync_update_date: ${{ vars.sync_update_date }}
         sync_ynab_to_sw: ${{ vars.sync_ynab_to_sw }}
+        multi_user_secrets_json: ${{ secrets.multi_user_secrets_json }}
       run: python main.py

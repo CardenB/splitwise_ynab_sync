@@ -47,6 +47,32 @@ This repo moves transactions from Splitwise to YNAB.
         - Name: `YNAB_ACCOUNT_NAME`, Value: 'Splitwise' (created in step 1).
 
 
+### NOTE: Support for multiple users
+To support multiple users, you can populate key `MULTI_USER_SECRETS_JSON` with a JSON string containing the secrets of all users. The JSON string should be in the following format:
+
+```json
+[
+    {
+        "SW_API_KEY": "splitwise_api_key",
+        "SW_CONSUMER_KEY": "splitwise_consumer_key",
+        "SW_CONSUMER_SECRET": "splitwise_consumer_secret_key",
+        "YNAB_PERSONAL_ACCESS_TOKEN": "ynab_personal_access_token",
+        "USER_NAME": "user_name" # This one doesn't matter, just for your reference. Must be non-empty to work.
+    },
+    {
+        "SW_API_KEY": "splitwise_api_key",
+        "SW_CONSUMER_KEY": "splitwise_consumer_key",
+        "SW_CONSUMER_SECRET": "splitwise_consumer_secret_key",
+        "YNAB_PERSONAL_ACCESS_TOKEN": "ynab_personal_access_token",
+        "USER_NAME": "user_name" # This one doesn't matter, just for your reference. Must be non-empty to work.
+    }
+]
+```
+
+### Cron
+
+The tool will iterate through these values and prefer these to the other secrets that are defined.
+
 The Github Actions now triggers this code repo at `12:00 UTC` everyday and transfers previous day's transactions from Splitwise to YNAB.
 
 If you would like to change the schedule time, change the cron expression in [python-app.yaml](.github/workflows/python-app.yml) file.

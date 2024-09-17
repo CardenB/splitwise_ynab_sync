@@ -1,3 +1,4 @@
+import json
 import os
 import logging
 from datetime import datetime, timedelta, timezone
@@ -220,21 +221,29 @@ class ynab_splitwise_transfer():
                         self.logger.info("Added a transaction on Splitwise")
                         update_ynab(transaction, transaction_friends)
                         self.logger.info("Updated YNAB transaction")
-                    
 
-if __name__=="__main__":
-    # load environment variables from yaml file (locally)
-    setup_environment_vars()
+def get_secrets_dict(input_dict: dict) -> dict:
+    output_dict = {}
+    for key, value in input_dict.items():
+        output_dict[key.lower()] = value
+    return output_dict
 
+def run_for_secrets_dict(secrets_dict: dict):
     # splitwise creds
-    sw_consumer_key = os.environ.get('sw_consumer_key')
-    sw_consumer_secret = os.environ.get('sw_consumer_secret')
-    sw_api_key = os.environ.get('sw_api_key')
+    sw_consumer_key = secrets_dict.get('sw_consumer_key')
+    assert sw_consumer_key is not None
+    sw_consumer_secret = secrets_dict.get('sw_consumer_secret')
+    assert sw_consumer_secret is not None
+    sw_api_key = secrets_dict.get('sw_api_key')
+    assert sw_api_key is not None
 
     # ynab creds
     ynab_budget_name = os.environ.get('ynab_budget_name')
+    assert ynab_budget_name is not None
     ynab_account_name = os.environ.get('ynab_account_name')
-    ynab_personal_access_token = os.environ.get('ynab_personal_access_token')
+    assert ynab_account_name is not None
+    ynab_personal_access_token = secrets_dict.get('ynab_personal_access_token')
+    assert ynab_personal_access_token is not None
 
     # Config Options
     use_update_date = os.environ.get('sync_update_date', 'false').lower() == 'true'
@@ -250,3 +259,17 @@ if __name__=="__main__":
     if sync_ynab_to_sw:
         # ynab to splitwise
         a.ynab_to_sw()
+
+
+if __name__=="__main__":
+    # load environment variables from yaml file (locally)
+    setup_environment_vars()
+    if multi_user_secrets := json.loads(os.environ.get('multi_user_secrets_json', '[]')):
+        for user_dict in multi_user_secrets:
+            user_dict = get_secrets_dict(user_dict)
+            if not user_dict.get("user_name", ""):
+                continue
+            print(f"Running for user {user_dict['user_name']}")
+            run_for_secrets_dict(user_dict)
+    else:
+        run_for_secrets_dict(dict(os.environ))
