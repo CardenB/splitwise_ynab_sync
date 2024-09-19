@@ -73,12 +73,13 @@ class ynab_splitwise_transfer():
                         continue
                 total_cost = -int(expense['cost']*1000)
                 what_i_paid = -(int(expense['cost']*1000)-int(expense['owed']*1000))
+                # This value will be negative (and thus inflow) if other people paid.
                 what_i_am_owed = int(expense['owed']*1000)
                 if expense['current_user_paid']:
                     transaction = {
                         "account_id": self.ynab_account_id,
                         "date":expense['date'],
-                        "amount": what_i_am_owed,
+                        "amount": int(what_i_am_owed),
                         "payee_name": expense['group_name'] if expense['group_name'] else "Splitwise",
                         "memo": f"{expense['description']}",
                         "cleared": "uncleared",
@@ -87,16 +88,16 @@ class ynab_splitwise_transfer():
                     transaction = {
                         "account_id": self.ynab_account_id,
                         "date":expense['date'],
-                        "amount": what_i_paid,
+                        "amount": int(what_i_paid),
                         "payee_name": expense['group_name'] if expense['group_name'] else "Splitwise",
                         "subtransactions": [
                             {
-                                "amount": total_cost,
+                                "amount": int(total_cost),
                                 "payee_name": expense['description'],
                                 "memo": "Total Cost"
                             },
                             {
-                                "amount": int(expense['owed']*1000),
+                                "amount": int(what_i_am_owed),
                                 "payee_name":combine_names(expense['users']),
                                 "memo": "What others owe."
                             },
