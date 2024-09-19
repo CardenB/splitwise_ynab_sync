@@ -23,7 +23,7 @@ class ynab_splitwise_transfer():
         # timestamps
         now = datetime.now(timezone.utc)
         self.end_date = datetime(now.year, now.month, now.day) + timedelta(days=1)
-        self.sw_start_date = self.end_date - timedelta(days=1)
+        self.sw_start_date = self.end_date - timedelta(days=7)
         self.ynab_start_date = self.end_date - timedelta(days=7)
 
         self.use_update_date = use_update_date
