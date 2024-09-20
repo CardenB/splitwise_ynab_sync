@@ -51,6 +51,11 @@ class SW():
                 if expense.creation_method == 'debt_consolidation':
                     self.logger.info(f"Skipping debt consolidation expense: {expense.getDate()}: {expense.getDescription()}")
                     continue
+                expense_date = datetime.strptime(expense.getDate(), "%Y-%m-%dT%H:%M:%SZ")
+
+                if expense_date > datetime.now():
+                    self.logger.info(f"Skipping future expense: {expense.getDate()}: {expense.getDescription()}")
+                    continue
                 owed_expense = {}
                 users = expense.getUsers()
                 user_names = []

@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import sys
 from datetime import datetime, timedelta, timezone
 
 from sw import SW
@@ -59,68 +60,71 @@ class ynab_splitwise_transfer():
                                         use_update=self.use_update_date)
 
         swids_in_ynab = self.get_swids_in_ynab()
-        if expenses:
-            # process
-            ynab_transactions = []
-            for expense in expenses:
-                # don't import deleted expenses
-                if expense['deleted_time']:
-                    continue
-                if expense.get('swid', ''):
-                    # Check if the expense is already in YNAB
-                    if expense['swid'] in swids_in_ynab:
-                        self.logger.info(f"Skipping Splitwise expense {expense['date']} {expense['description']} {expense['swid']} as it is already in YNAB.")
-                        continue
-                total_cost = -int(expense['cost']*1000)
-                what_i_paid = -(int(expense['cost']*1000)-int(expense['owed']*1000))
-                # This value will be negative (and thus inflow) if other people paid.
-                what_i_am_owed = int(expense['owed']*1000)
-                if expense['current_user_paid']:
-                    transaction = {
-                        "account_id": self.ynab_account_id,
-                        "date":expense['date'],
-                        "amount": int(what_i_am_owed),
-                        "payee_name": expense['group_name'] if expense['group_name'] else "Splitwise",
-                        "memo": f"{expense['description']}",
-                        "cleared": "uncleared",
-                    }
-                else:
-                    transaction = {
-                        "account_id": self.ynab_account_id,
-                        "date":expense['date'],
-                        "amount": int(what_i_paid),
-                        "payee_name": expense['group_name'] if expense['group_name'] else "Splitwise",
-                        "subtransactions": [
-                            {
-                                "amount": int(total_cost),
-                                "payee_name": expense['description'],
-                                "memo": "Total Cost"
-                            },
-                            {
-                                "amount": int(what_i_am_owed),
-                                "payee_name":combine_names(expense['users']),
-                                "memo": "What others owe."
-                            },
-                        ],
-                        "memo":" ".join([expense['description'].strip() ,"with", combine_names(expense['users'])]),
-                        "cleared": "uncleared"
-                    }
-                if expense.get('swid', ''):
-                    transaction['memo'] = f"{transaction['memo']} {expense['swid']}]"
-                ynab_transactions.append(transaction)
-            # export to ynab
-            if ynab_transactions:
-                self.logger.info(f"Writing {len(ynab_transactions)} record(s) to YNAB.")
-                for transaction in ynab_transactions:
-                    self.logger.info(f"Adding transaction: {transaction}")
-                try:
-                    response = self.ynab.create_transaction(self.ynab_budget_id, ynab_transactions)
-                except Exception as e:
-                    self.logger.error(f"Error writing transactions to YNAB: {e}")
-            else:
-                self.logger.info("No transactions to write to YNAB.")
-        else:
+        if not expenses:
             self.logger.info("No transactions to write to YNAB.")
+            return 0
+        # process
+        ynab_transactions = []
+        for expense in expenses:
+            # don't import deleted expenses
+            if expense['deleted_time']:
+                continue
+            if expense.get('swid', ''):
+                # Check if the expense is already in YNAB
+                if expense['swid'] in swids_in_ynab:
+                    self.logger.info(f"Skipping Splitwise expense {expense['date']} {expense['description']} {expense['swid']} as it is already in YNAB.")
+                    continue
+            total_cost = -int(expense['cost']*1000)
+            what_i_paid = -(int(expense['cost']*1000)-int(expense['owed']*1000))
+            # This value will be negative (and thus inflow) if other people paid.
+            what_i_am_owed = int(expense['owed']*1000)
+            if expense['current_user_paid']:
+                transaction = {
+                    "account_id": self.ynab_account_id,
+                    "date":expense['date'],
+                    "amount": int(what_i_am_owed),
+                    "payee_name": expense['group_name'] if expense['group_name'] else "Splitwise",
+                    "memo": f"{expense['description']}",
+                    "cleared": "uncleared",
+                }
+            else:
+                transaction = {
+                    "account_id": self.ynab_account_id,
+                    "date":expense['date'],
+                    "amount": int(what_i_paid),
+                    "payee_name": expense['group_name'] if expense['group_name'] else "Splitwise",
+                    "subtransactions": [
+                        {
+                            "amount": int(total_cost),
+                            "payee_name": expense['description'],
+                            "memo": "Total Cost"
+                        },
+                        {
+                            "amount": int(what_i_am_owed),
+                            "payee_name":combine_names(expense['users']),
+                            "memo": "What others owe."
+                        },
+                    ],
+                    "memo":" ".join([expense['description'].strip() ,"with", combine_names(expense['users'])]),
+                    "cleared": "uncleared"
+                }
+            if expense.get('swid', ''):
+                transaction['memo'] = f"{transaction['memo']} {expense['swid']}]"
+            ynab_transactions.append(transaction)
+        # export to ynab
+        if not ynab_transactions:
+            self.logger.info("No transactions to write to YNAB.")
+            return 0
+        self.logger.info(f"Writing {len(ynab_transactions)} record(s) to YNAB.")
+        try:
+            response = self.ynab.create_transaction(self.ynab_budget_id, ynab_transactions)
+        except Exception as e:
+            self.logger.error(f"Error writing transactions to YNAB: {e}")
+            # log the transactions that failed
+            for transaction in ynab_transactions:
+                self.logger.error(f"Failed transaction: {transaction['date']} - {transaction['memo']} - {transaction['amount']}")
+            return 1
+        return 0
 
     def ynab_to_sw(self):
         def extract_names(s):
@@ -234,7 +238,7 @@ def get_secrets_dict(input_dict: dict) -> dict:
         output_dict[key.lower()] = value
     return output_dict
 
-def run_for_secrets_dict(secrets_dict: dict):
+def run_for_secrets_dict(secrets_dict: dict) -> int:
     # splitwise creds
     sw_consumer_key = secrets_dict.get('sw_consumer_key')
     assert sw_consumer_key is not None
@@ -261,21 +265,26 @@ def run_for_secrets_dict(secrets_dict: dict):
                                 use_update_date=use_update_date)
 
     # splitwise to ynab
-    a.sw_to_ynab()
+    ret = a.sw_to_ynab()
     if sync_ynab_to_sw:
         # ynab to splitwise
         a.ynab_to_sw()
+    return ret
 
 
 if __name__=="__main__":
     # load environment variables from yaml file (locally)
     setup_environment_vars()
+    ret = 0
     if multi_user_secrets := json.loads(os.environ.get('multi_user_secrets_json', '[]')):
         for user_dict in multi_user_secrets:
             user_dict = get_secrets_dict(user_dict)
             if not user_dict.get("user_name", ""):
                 continue
             print(f"Running for user {user_dict['user_name']}")
-            run_for_secrets_dict(user_dict)
+            cur_ret = run_for_secrets_dict(user_dict)
+            if cur_ret != 0:
+                ret = 1
     else:
-        run_for_secrets_dict(dict(os.environ))
+        ret = run_for_secrets_dict(dict(os.environ))
+    sys.exit(ret)
