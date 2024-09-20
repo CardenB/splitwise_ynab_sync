@@ -33,12 +33,20 @@ class SW():
     def get_expenses(self, dated_before=None, dated_after=None, use_update: bool=False):
         def _fetch_expenses(offset: int=0):
             # get all expenses between 2 dates
+            kwargs = dict(
+                    limit=self.limit,
+                    offset=offset,
+            )
             if use_update:
                 self.logger.info("Using updated_at instead of expense date for finding expenses.")
-                expenses = self.sw.getExpenses(limit=self.limit, offset=offset, updated_before=dated_before, updated_after=dated_after)
+                kwargs['updated_after'] = dated_after
+                if dated_before is not None:
+                    kwargs['updated_before'] = dated_before
             else:
-                expenses = self.sw.getExpenses(limit=self.limit, offset=offset, dated_before=dated_before, dated_after=dated_after)
-            return expenses
+                kwargs['dated_after'] = dated_after
+                if dated_before is not None:
+                    kwargs['dated_before'] = dated_before
+            return self.sw.getExpenses(**kwargs)
         cur_offset = 0
         cur_expenses = _fetch_expenses()
         while cur_expenses:

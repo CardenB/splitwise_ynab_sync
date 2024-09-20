@@ -2,7 +2,8 @@ import json
 import os
 import logging
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, date, timezone
+from typing import Optional
 
 from sw import SW
 from ynab import YNABClient
@@ -21,15 +22,18 @@ class ynab_splitwise_transfer():
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
         self.logger = logging.getLogger(__name__)
 
-        # timestamps
+        # # timestamps
+        # now = datetime.now(timezone.utc)
+        # Prefer to just take all future transactions
         now = datetime.now(timezone.utc)
         self.end_date = datetime(now.year, now.month, now.day) + timedelta(days=1)
-        self.sw_start_date = self.end_date - timedelta(days=7)
-        self.ynab_start_date = self.end_date - timedelta(days=7)
+        # self.end_date = None
+        self.sw_start_date = datetime(now.year, now.month, now.day) - timedelta(days=7)
+        self.ynab_start_date = datetime(now.year, now.month, now.day) - timedelta(days=7)
 
         self.use_update_date = use_update_date
 
-    def get_swids_in_ynab(self):
+    def get_swids_in_ynab(self, since_date: Optional[date]=None):
         """
         Gets all Splitwise expense IDs from YNAB transactions in the splitwise account.
         WARNING: Will process ALL transactions in the Splitwise account. Hopefully rate limits will not become an issue.
@@ -40,7 +44,7 @@ class ynab_splitwise_transfer():
         Set of all Splitwise expense IDs in YNAB transactions.
         """
         # TODO(carden): Account for created/updated date being different than transaction date.
-        ynab_splitwise_transactions_response = self.ynab.get_transactions(self.ynab_budget_id, self.ynab_account_id)
+        ynab_splitwise_transactions_response = self.ynab.get_transactions(self.ynab_budget_id, self.ynab_account_id, since_date=since_date)
         splitwise_expense_ids = set()
         ynab_splitwise_scheduled_transactions_response = self.ynab.get_scheduled_transactions(self.ynab_budget_id)
         all_transactions = ynab_splitwise_transactions_response.get('data', {}).get('transactions', []) + ynab_splitwise_scheduled_transactions_response.get('data', {}).get('scheduled_transactions', [])
@@ -60,11 +64,13 @@ class ynab_splitwise_transfer():
         expenses = self.sw.get_expenses(dated_after=self.sw_start_date,
                                         dated_before=self.end_date,
                                         use_update=self.use_update_date)
+        expenses = list(expenses)
 
-        swids_in_ynab = self.get_swids_in_ynab()
         if not expenses:
             self.logger.info("No transactions to write to YNAB.")
             return 0
+        earliest_splitwise_date = min([datetime.strptime(expense['date'], "%Y-%m-%dT%H:%M:%SZ").date() for expense in expenses])
+        swids_in_ynab = self.get_swids_in_ynab(since_date=earliest_splitwise_date)
         # process
         ynab_transactions = []
         scheduled_transactions = []
