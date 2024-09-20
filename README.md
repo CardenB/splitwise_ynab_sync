@@ -42,8 +42,8 @@ This repo moves transactions from Splitwise to YNAB.
         - Name: `SW_API_KEY`, Secret: `API keys` from 2b.
         - Name: `SW_CONSUMER_KEY`, Secret: `Consumer Key` from 2b.
         - Name: `SW_CONSUMER_SECRET`, Secret: `Consumer Secret` from 2b.
-    - Similarly, Under `Variables` tab, using `New repository variable`, add:
         - Name: `YNAB_BUDGET_NAME`, Value: your YNAB budget name (check your YNAB app or website, if you don't know, fill 'My Budget')
+    - Similarly, Under `Variables` tab, using `New repository variable`, add:
         - Name: `YNAB_ACCOUNT_NAME`, Value: 'Splitwise' (created in step 1).
 
 
@@ -58,6 +58,7 @@ To support multiple users, you can populate key `MULTI_USER_SECRETS_JSON` with a
         "SW_CONSUMER_SECRET": "splitwise_consumer_secret_key",
         "YNAB_PERSONAL_ACCESS_TOKEN": "ynab_personal_access_token",
         "USER_NAME": "user_name" # This one doesn't matter, just for your reference. Must be non-empty to work.
+        "YNAB_BUDGET_NAME": "My Budget"
     },
     {
         "SW_API_KEY": "splitwise_api_key",
@@ -65,6 +66,7 @@ To support multiple users, you can populate key `MULTI_USER_SECRETS_JSON` with a
         "SW_CONSUMER_SECRET": "splitwise_consumer_secret_key",
         "YNAB_PERSONAL_ACCESS_TOKEN": "ynab_personal_access_token",
         "USER_NAME": "user_name" # This one doesn't matter, just for your reference. Must be non-empty to work.
+        "YNAB_BUDGET_NAME": "My Budget"
     }
 ]
 ```
@@ -92,4 +94,4 @@ If you would like to change the schedule time, change the cron expression in [py
 Github Actions, unfortunately, deactivates after 60 days of inactivity. So, you might have to manually enable the workflow again every 60 days.
 
 
-Contact me at devsama42@gmail.com
+Contact me at cardenbag@gmail.com

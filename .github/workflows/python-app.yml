@@ -31,7 +31,7 @@ jobs:
         sw_consumer_secret: ${{ secrets.sw_consumer_secret }}
         sw_api_key: ${{ secrets.sw_api_key }}
         ynab_personal_access_token: ${{ secrets.ynab_personal_access_token }}
-        ynab_budget_name: ${{ vars.ynab_budget_name }}
+        ynab_budget_name: ${{ secrets.ynab_budget_name }}
         ynab_account_name: ${{ vars.ynab_account_name }}
         sync_update_date: ${{ vars.sync_update_date }}
         sync_ynab_to_sw: ${{ vars.sync_ynab_to_sw }}

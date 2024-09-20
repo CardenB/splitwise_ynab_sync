@@ -239,7 +239,7 @@ def run_for_secrets_dict(secrets_dict: dict):
     assert sw_api_key is not None
 
     # ynab creds
-    ynab_budget_name = os.environ.get('ynab_budget_name')
+    ynab_budget_name = secrets_dict.get('ynab_budget_name')
     assert ynab_budget_name is not None
     ynab_account_name = os.environ.get('ynab_account_name')
     assert ynab_account_name is not None
