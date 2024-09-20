@@ -111,6 +111,8 @@ class ynab_splitwise_transfer():
             # export to ynab
             if ynab_transactions:
                 self.logger.info(f"Writing {len(ynab_transactions)} record(s) to YNAB.")
+                for transaction in ynab_transactions:
+                    self.logger.info(f"Adding transaction: {transaction}")
                 try:
                     response = self.ynab.create_transaction(self.ynab_budget_id, ynab_transactions)
                 except Exception as e:
