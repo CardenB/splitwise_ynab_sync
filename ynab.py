@@ -34,6 +34,10 @@ class YNABClient:
         data = {"transactions": transactions}
         return self._make_request("POST", endpoint, data=data)
 
+    def create_scheduled_transaction(self, budget_id, transaction):
+        endpoint = f"budgets/{budget_id}/scheduled_transactions"
+        data = {"scheduled_transaction": transaction}
+        return self._make_request("POST", endpoint, data=data)
     
     def get_accounts(self, budget_id):
         return self._make_request("GET", f"budgets/{budget_id}/accounts")
@@ -69,6 +73,10 @@ class YNABClient:
 
         return self._make_request("GET", endpoint, params=params)
     
+    def get_scheduled_transactions(self, budget_id):
+        endpoint = f"budgets/{budget_id}/scheduled_transactions"
+        return self._make_request("GET", endpoint)
+
     def get_last_transaction(self, budget_id, account_id):
         transactions = self.get_transactions(budget_id, account_id)
         if not transactions['data']['transactions']:

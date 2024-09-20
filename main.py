@@ -42,7 +42,9 @@ class ynab_splitwise_transfer():
         # TODO(carden): Account for created/updated date being different than transaction date.
         ynab_splitwise_transactions_response = self.ynab.get_transactions(self.ynab_budget_id, self.ynab_account_id)
         splitwise_expense_ids = set()
-        for transaction in ynab_splitwise_transactions_response.get('data', {}).get('transactions', []):
+        ynab_splitwise_scheduled_transactions_response = self.ynab.get_scheduled_transactions(self.ynab_budget_id)
+        all_transactions = ynab_splitwise_transactions_response.get('data', {}).get('transactions', []) + ynab_splitwise_scheduled_transactions_response.get('data', {}).get('scheduled_transactions', [])
+        for transaction in all_transactions:
             # check the memo for 'splitwise' keyword
             memo = transaction.get('memo', '')
             if not memo:
@@ -65,6 +67,7 @@ class ynab_splitwise_transfer():
             return 0
         # process
         ynab_transactions = []
+        scheduled_transactions = []
         for expense in expenses:
             # don't import deleted expenses
             if expense['deleted_time']:
@@ -110,14 +113,25 @@ class ynab_splitwise_transfer():
                 }
             if expense.get('swid', ''):
                 transaction['memo'] = f"{transaction['memo']} {expense['swid']}]"
-            ynab_transactions.append(transaction)
+            transaction_date = datetime.strptime(expense['date'], "%Y-%m-%dT%H:%M:%SZ")
+            if transaction_date > datetime.now():
+                scheduled_transactions.append(transaction)
+            else:
+                ynab_transactions.append(transaction)
         # export to ynab
-        if not ynab_transactions:
+        if not (ynab_transactions or scheduled_transactions):
             self.logger.info("No transactions to write to YNAB.")
             return 0
         self.logger.info(f"Writing {len(ynab_transactions)} record(s) to YNAB.")
+        self.logger.info(f"Writing {len(scheduled_transactions)} scheduled transactions to YNAB.")
         try:
-            response = self.ynab.create_transaction(self.ynab_budget_id, ynab_transactions)
+            if ynab_transactions:
+                _ = self.ynab.create_transaction(self.ynab_budget_id, ynab_transactions)
+            for scheduled_transaction in scheduled_transactions:
+                if 'cleared' in scheduled_transaction:
+                    del scheduled_transaction['cleared']
+                scheduled_transaction['frequency'] = 'never'
+                _ = self.ynab.create_scheduled_transaction(self.ynab_budget_id, scheduled_transaction)
         except Exception as e:
             self.logger.error(f"Error writing transactions to YNAB: {e}")
             # log the transactions that failed
