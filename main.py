@@ -111,7 +111,10 @@ class ynab_splitwise_transfer():
             # export to ynab
             if ynab_transactions:
                 self.logger.info(f"Writing {len(ynab_transactions)} record(s) to YNAB.")
-                response = self.ynab.create_transaction(self.ynab_budget_id, ynab_transactions)
+                try:
+                    response = self.ynab.create_transaction(self.ynab_budget_id, ynab_transactions)
+                except Exception as e:
+                    self.logger.error(f"Error writing transactions to YNAB: {e}")
             else:
                 self.logger.info("No transactions to write to YNAB.")
         else:
@@ -241,10 +244,10 @@ def run_for_secrets_dict(secrets_dict: dict):
     # ynab creds
     ynab_budget_name = secrets_dict.get('ynab_budget_name')
     assert ynab_budget_name is not None
-    ynab_account_name = os.environ.get('ynab_account_name')
-    assert ynab_account_name is not None
     ynab_personal_access_token = secrets_dict.get('ynab_personal_access_token')
     assert ynab_personal_access_token is not None
+    ynab_account_name = os.environ.get('ynab_account_name')
+    assert ynab_account_name is not None
 
     # Config Options
     use_update_date = os.environ.get('sync_update_date', 'false').lower() == 'true'
