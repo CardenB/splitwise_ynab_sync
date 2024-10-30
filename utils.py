@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import os
 import re
 import yaml
@@ -37,6 +38,37 @@ def extract_swid_from_memo(memo) -> tuple[str, int, str]:
     if match:
         return match.group(0), int(match.group(1)), match.group(2) 
     return None, None, None
+
+def check_if_needs_to_update(sw_expense: dict, ynab_transaction: dict) -> bool:
+    """
+    Parses SWID and updated time hash from both sw and ynab transactions and compares them.
+    Determines if ynab transaction should update based on the criteria.
+
+    YNAB transaction should update if the SWID hash changes but the expense ID is the same.
+    """
+    logger = logging.getLogger(__name__)
+    expense_swid = sw_expense.get('swid', '')
+    _, expense_swid, _ = extract_swid_from_memo(sw_expense.get('swid', ''))
+    if not expense_swid:
+        logger.warning(f"No SWID found in Splitwise expense {sw_expense['id']}")
+        return False
+    _, ynab_swid, ynab_hash = extract_swid_from_memo(ynab_transaction.get('memo', ''))
+    if not ynab_swid:
+        logger.warning(f"No SWID found in YNAB transaction {ynab_transaction['id']}")
+        return False
+    if ynab_hash is None:
+        logger.error("No hash found in YNAB memo but swid found in memo")
+    if ynab_swid != expense_swid:
+        logger.error(f"SWID mismatch: {ynab_swid} != {expense_swid}")
+        return False
+
+    sw_update_time = sw_expense.get('updated_time', '')
+    if not sw_update_time:
+        logger.warning(f"No updated time found in Splitwise expense {sw_expense}")
+        return False
+
+    generated_hash_for_sw_update_time = generate_truncated_hash_for_updated_time(sw_update_time)
+    return ynab_swid == expense_swid and generated_hash_for_sw_update_time != ynab_hash
 
 def generate_truncated_hash_for_updated_time(updated_at: str):
     """

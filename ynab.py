@@ -94,6 +94,15 @@ class YNABClient:
         endpoint = f"budgets/{budget_id}/transactions/{transaction_id}"
         return self._make_request("PATCH", endpoint, data=transaction_data)
 
+    def delete_transaction(self, budget_id, transaction_id):
+        endpoint = f"budgets/{budget_id}/transactions/{transaction_id}"
+        return self._make_request("DELETE", endpoint)
+
+    def update_transactions(self, budget_id, transactions):
+        endpoint = f"budgets/{budget_id}/transactions"
+        data = {"transactions": transactions}
+        return self._make_request("PATCH", endpoint, data=data)
+
 
 if __name__ == "__main__":
     # load environment variables from yaml file (locally)
@@ -131,10 +140,5 @@ if __name__ == "__main__":
         }
     ]
 
-    # response = client.create_transaction(budget_id, transactions)
-    # print("Transactions created on YNAB.")
-
     t = client.get_last_transaction(budget_id, account_id)
     print(t)
-    # transactions = client.get_transactions(budget_id, account_id, since_date="2023-11-28")
-    # print(transactions)

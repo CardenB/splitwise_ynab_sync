@@ -7,7 +7,7 @@ from typing import Optional
 
 from sw import SW
 from ynab import YNABClient
-from utils import setup_environment_vars, combine_names, extract_swid_from_memo
+from utils import setup_environment_vars, check_if_needs_to_update, combine_names, extract_swid_from_memo
 
 class ynab_splitwise_transfer():
     def __init__(self, sw_consumer_key, sw_consumer_secret,sw_api_key, 
@@ -33,6 +33,32 @@ class ynab_splitwise_transfer():
 
         self.use_update_date = use_update_date
 
+    def ynab_swid_to_transaction_mapping(self, since_date: Optional[date]=None) -> dict[str, dict]:
+        """
+        Gets all Splitwise expense IDs from YNAB transactions in the splitwise account.
+        Uses expense ID as key in the dict and then maps to value for updates.
+        WARNING: Will process ALL transactions in the Splitwise account. Hopefully rate limits will not become an issue.
+
+        This is used to determine if the splitwise transaction is already added so it will not be added again.
+        Or it is used to determine if a ynab transaction needs to be updated.
+
+        Returns:
+        Set of all Splitwise expense IDs in YNAB transactions.
+        """
+        ynab_splitwise_transactions_response = self.ynab.get_transactions(self.ynab_budget_id, self.ynab_account_id, since_date=since_date)
+        expense_id_to_transaction_mapping = dict()
+        ynab_splitwise_scheduled_transactions_response = self.ynab.get_scheduled_transactions(self.ynab_budget_id)
+        all_transactions = ynab_splitwise_transactions_response.get('data', {}).get('transactions', []) + ynab_splitwise_scheduled_transactions_response.get('data', {}).get('scheduled_transactions', [])
+        for transaction in all_transactions:
+            # check the memo for 'splitwise' keyword
+            memo = transaction.get('memo', '')
+            if not memo:
+                continue
+            _, sw_id, _ = extract_swid_from_memo(memo)
+            if sw_id is not None:
+                expense_id_to_transaction_mapping[sw_id] = transaction
+        return expense_id_to_transaction_mapping
+
     def get_swids_in_ynab(self, since_date: Optional[date]=None):
         """
         Gets all Splitwise expense IDs from YNAB transactions in the splitwise account.
@@ -43,7 +69,6 @@ class ynab_splitwise_transfer():
         Returns:
         Set of all Splitwise expense IDs in YNAB transactions.
         """
-        # TODO(carden): Account for created/updated date being different than transaction date.
         ynab_splitwise_transactions_response = self.ynab.get_transactions(self.ynab_budget_id, self.ynab_account_id, since_date=since_date)
         splitwise_expense_ids = set()
         ynab_splitwise_scheduled_transactions_response = self.ynab.get_scheduled_transactions(self.ynab_budget_id)
@@ -70,19 +95,33 @@ class ynab_splitwise_transfer():
             self.logger.info("No transactions to write to YNAB.")
             return 0
         earliest_splitwise_date = min([datetime.strptime(expense['date'], "%Y-%m-%dT%H:%M:%SZ").date() for expense in expenses])
-        swids_in_ynab = self.get_swids_in_ynab(since_date=earliest_splitwise_date)
-        # process
+        swid_to_transaction_mapping = self.ynab_swid_to_transaction_mapping(since_date=earliest_splitwise_date)
         ynab_transactions = []
         scheduled_transactions = []
+        updated_transactions = []
         for expense in expenses:
             # don't import deleted expenses
             if expense['deleted_time']:
+                _, expense_swid, _ = extract_swid_from_memo(expense['swid'])
+                if expense_swid in swid_to_transaction_mapping:
+                    _, transaction_swid, _ = extract_swid_from_memo(swid_to_transaction_mapping[expense_swid]['memo'])
+                    if expense_swid == transaction_swid:
+                        self.logger.info(f"Deleting expense {expense['date']} {expense['description']} {expense['swid']} from YNAB as it has been deleted from Splitwise")
+                        self.ynab.delete_transaction(self.ynab_budget_id, swid_to_transaction_mapping[expense_swid]['id'])
+                else:
+                    self.logger.info(f"Skipping deleted expense {expense['date']} {expense['description']} {expense['swid']} as it is not found in YNAB")
                 continue
             if expense.get('swid', ''):
+                _, expense_swid, _ = extract_swid_from_memo(expense['swid'])
                 # Check if the expense is already in YNAB
-                if expense['swid'] in swids_in_ynab:
-                    self.logger.info(f"Skipping Splitwise expense {expense['date']} {expense['description']} {expense['swid']} as it is already in YNAB.")
-                    continue
+                if expense_swid in swid_to_transaction_mapping:
+                    ynab_transaction = swid_to_transaction_mapping[expense_swid]
+                    needs_to_update = check_if_needs_to_update(sw_expense=expense, ynab_transaction=ynab_transaction)
+                    if not needs_to_update:
+                        self.logger.info(f"Skipping Splitwise expense {expense['date']} {expense['description']} {expense['swid']} as it is already in YNAB.")
+                        continue
+
+                    expense['transaction_id_to_update'] = ynab_transaction['id']
             total_cost = -int(expense['cost']*1000)
             what_i_paid = -(int(expense['cost']*1000)-int(expense['owed']*1000))
             # This value will be negative (and thus inflow) if other people paid.
@@ -118,21 +157,29 @@ class ynab_splitwise_transfer():
                     "cleared": "uncleared"
                 }
             if expense.get('swid', ''):
-                transaction['memo'] = f"{transaction['memo']} {expense['swid']}]"
+                transaction['memo'] = f"{transaction['memo']} {expense['swid']}"
+
             transaction_date = datetime.strptime(expense['date'], "%Y-%m-%dT%H:%M:%SZ")
             if transaction_date > datetime.now():
                 scheduled_transactions.append(transaction)
+            elif expense.get('transaction_id_to_update', None):
+                transaction['id'] = expense['transaction_id_to_update']
+                updated_transactions.append(transaction)
+
             else:
                 ynab_transactions.append(transaction)
         # export to ynab
-        if not (ynab_transactions or scheduled_transactions):
+        if not (ynab_transactions or scheduled_transactions or updated_transactions):
             self.logger.info("No transactions to write to YNAB.")
             return 0
         self.logger.info(f"Writing {len(ynab_transactions)} record(s) to YNAB.")
         self.logger.info(f"Writing {len(scheduled_transactions)} scheduled transactions to YNAB.")
+        self.logger.info(f"Writing {len(updated_transactions)} updated transactions to YNAB.")
         try:
             if ynab_transactions:
                 _ = self.ynab.create_transaction(self.ynab_budget_id, ynab_transactions)
+            if updated_transactions:
+                _ = self.ynab.update_transactions(self.ynab_budget_id, updated_transactions)
             for scheduled_transaction in scheduled_transactions:
                 if 'cleared' in scheduled_transaction:
                     del scheduled_transaction['cleared']
