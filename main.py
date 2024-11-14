@@ -126,6 +126,7 @@ class ynab_splitwise_transfer():
             what_i_paid = -(int(expense['cost']*1000)-int(expense['owed']*1000))
             # This value will be negative (and thus inflow) if other people paid.
             what_i_am_owed = int(expense['owed']*1000)
+            self.logger.info(f"Importing Splitwise expense {expense['date']} {expense['description']} {expense['swid']}")
             if expense['current_user_paid']:
                 transaction = {
                     "account_id": self.ynab_account_id,
