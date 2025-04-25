@@ -134,7 +134,7 @@ class ynab_splitwise_transfer():
                     "amount": int(what_i_am_owed),
                     "payee_name": expense['group_name'] if expense['group_name'] else "Splitwise",
                     "memo": f"{expense['description']}",
-                    "cleared": "uncleared",
+                    "cleared": "cleared",
                 }
             else:
                 transaction = {
@@ -155,13 +155,20 @@ class ynab_splitwise_transfer():
                         },
                     ],
                     "memo":" ".join([expense['description'].strip() ,"with", combine_names(expense['users'])]),
-                    "cleared": "uncleared"
+                    "cleared": "cleared"
                 }
             if expense.get('swid', ''):
                 transaction['memo'] = f"{transaction['memo']} {expense['swid']}"
 
+            transaction["import_id"] = self.ynab.create_import_id(amount=int(what_i_paid),
+                                                                  date=datetime.strptime(expense['date'], "%Y-%m-%d"),
+                                                                  import_hash=expense['swid'] if expense['swid'] else None)
+
             transaction_date = datetime.strptime(expense['date'], "%Y-%m-%dT%H:%M:%SZ")
             if transaction_date > datetime.now():
+                # Scheduled transactions get uncleared.
+                # TODO(carden): Make sure status is updated to cleared once the date passes.
+                transaction['cleared'] = "uncleared"
                 scheduled_transactions.append(transaction)
             elif expense.get('transaction_id_to_update', None):
                 transaction['id'] = expense['transaction_id_to_update']

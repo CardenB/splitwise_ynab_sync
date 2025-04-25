@@ -1,6 +1,8 @@
 # https://github.com/deanmcgregor/ynab-python
-import requests
+import logging
 import os
+import re
+import requests
 from utils import setup_environment_vars
 
 class YNABClient:
@@ -12,6 +14,7 @@ class YNABClient:
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json"
         }
+        self.logger = logging.getLogger(__name__)
 
     def _make_request(self, method, endpoint, params=None, data=None):
         url = f"{self.BASE_URL}/{endpoint}"
@@ -28,6 +31,26 @@ class YNABClient:
             if budget['name'] == budget_name:
                 return budget['id']
         return None
+
+    def create_import_id(self, amount, date, import_hash=None):
+        """
+        Create an import ID for a transaction for use with YNAB API.
+
+        Args:
+            amount (int): The amount of the transaction in milliunits.
+                          This is the same value that you would put in the create transaction api.
+            date (str): The date of the transaction in "YYYY-MM-DD" format.
+            import_hash (Optional[str]): A unique hash for the transaction.
+        """
+        # return none if date is not a string with "YYYY-MM-DD" format
+        # Check date format with regex.
+        if not (isinstance(date, str) and re.match(r"\d{4}-\d{2}-\d{2}", date)):
+            self.logger.error(f"Invalid date format: {date}. Expected 'YYYY-MM-DD'.")
+            return None
+        import_id = f"YNAB: {str(float(amount)*1000)}:{date}"
+        if import_hash is not None:
+            import_id += f":{import_hash}"
+        return import_id
 
     def create_transaction(self, budget_id, transactions):
         endpoint = f"budgets/{budget_id}/transactions"

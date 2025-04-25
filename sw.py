@@ -89,8 +89,10 @@ class SW():
                 # then also logs individual debt consolidation for each group. We handle this by only keeping group wise
                 # debt consolidation expenses.
                 if expense.creation_method == 'debt_consolidation' and not group_name:
-                    self.logger.info(f"Skipping debt consolidation expense: {expense.getDate()}: {expense.getDescription()} and deferring to other debt consolidation expenses within individual budgets.")
-                    continue
+                    self.logger.info(f"Found debt consolidation expense: {expense.getDate()}: {expense.getDescription()} and deferring to other debt consolidation expenses within individual budgets.")
+                    # continue
+                    # Process debt consolidation expenses normally as they are needed to interact with payment expenses.
+                    # Skipping these was only necessary because we also skipped payment expenses.
                 owed_expense['group_name'] = group_name
                 for user in users:
                     user_first_last_name = f"{user.getFirstName()} {user.getLastName()} - {user.getId()}"
