@@ -52,8 +52,19 @@ class SW():
         while cur_expenses:
             for expense in cur_expenses:
                 # How do I treat "payments"?
+                # If expense is a payment, then it is used to settle a balance.
+                # Ex: User pays with Venmo and not splitwise pay.
+                # Cost for these payments is POSITIVE. The reason is that the payment shifts
+                # the splitwise balance to the payment method. Think of it like a transfer.
+                # Thus, we do not need special handling of the payment.
+                # NOTE: perhaps some exception is here when settle up is used. May need to debug this in the future.
                 if expense.payment:
-                    continue
+                    # Useful to debug locally. Uncomment in that circumstance.
+                    # Commented out so expense details don't show in prod logs.
+                    # self.logger.info(f"Found payment: {expense.getDate()}: {expense.getCost()}, {expense.getDescription()}")
+                    # continue
+                    self.logger.info("Found payment expense, processing normally.")
+
                 owed_expense = {}
                 users = expense.getUsers()
                 user_names = []
@@ -88,6 +99,12 @@ class SW():
                         # When a user split expenses with others, the user paid the full amount and they "owe" the amount
                         # they actually were supposed to pay.
                         paid = float(user.getOwedShare())
+                        # In the event that the transaction is a "payment" made by the user, owed will be a positive value, since you
+                        # are settling the splitwise balance and it must be inverted. This is like the user is being
+                        # paid, however, no one is actually paying. It's just a transaction to represent the transfer.
+                        # NOTE: if someone else made the payment, this case is completely inverted.
+                        # Otherwise, in the typical case, "owed" is likely zero, since the user paid.
+                        # If the user is getting paid by someone else in the transaction, owed will again be positive.
                         owed_expense['owed'] = expense_cost - paid
                         owed_expense['date'] = expense.getDate()
                         owed_expense['created_time'] = expense.getCreatedAt()
