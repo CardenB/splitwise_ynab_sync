@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import secrets
 import sys
 from datetime import datetime, timedelta, date, timezone
 from typing import Optional
@@ -161,11 +162,8 @@ class ynab_splitwise_transfer():
                 transaction['memo'] = f"{transaction['memo']} {expense['swid']}"
 
             import_id_date = datetime.strptime(expense['date'], "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d")
-            import_hash = None
-            # TODO(carden): Come up with better way to generate hash.
-            # if expense.get('swid', ''):
-            #     _, swid, hash = extract_swid_from_memo(expense['swid'])
-            #     import_hash = f"{swid}{hash}"
+            # Generate a random 4-byte hex string for the import hash
+            import_hash = secrets.token_hex(4)
             transaction["import_id"] = self.ynab.create_import_id(amount=transaction['amount'],
                                                                   date=import_id_date,
                                                                   import_hash=import_hash)
