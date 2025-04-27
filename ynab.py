@@ -47,7 +47,7 @@ class YNABClient:
         if not (isinstance(date, str) and re.match(r"\d{4}-\d{2}-\d{2}", date)):
             self.logger.error(f"Invalid date format: {date}. Expected 'YYYY-MM-DD'.")
             return None
-        import_id = f"YNAB: {str(float(amount)*1000)}:{date}"
+        import_id = f"YNAB:{str(amount)}:{date}"
         if import_hash is not None:
             import_id += f":{import_hash}"
         return import_id

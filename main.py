@@ -160,9 +160,15 @@ class ynab_splitwise_transfer():
             if expense.get('swid', ''):
                 transaction['memo'] = f"{transaction['memo']} {expense['swid']}"
 
-            transaction["import_id"] = self.ynab.create_import_id(amount=int(what_i_paid),
-                                                                  date=datetime.strptime(expense['date'], "%Y-%m-%d"),
-                                                                  import_hash=expense['swid'] if expense['swid'] else None)
+            import_id_date = datetime.strptime(expense['date'], "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d")
+            import_hash = None
+            # TODO(carden): Come up with better way to generate hash.
+            # if expense.get('swid', ''):
+            #     _, swid, hash = extract_swid_from_memo(expense['swid'])
+            #     import_hash = f"{swid}{hash}"
+            transaction["import_id"] = self.ynab.create_import_id(amount=transaction['amount'],
+                                                                  date=import_id_date,
+                                                                  import_hash=import_hash)
 
             transaction_date = datetime.strptime(expense['date'], "%Y-%m-%dT%H:%M:%SZ")
             if transaction_date > datetime.now():
