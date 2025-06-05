@@ -11,9 +11,9 @@ from ynab import YNABClient
 from utils import setup_environment_vars, check_if_needs_to_update, combine_names, extract_swid_from_memo
 
 class ynab_splitwise_transfer():
-    def __init__(self, sw_consumer_key, sw_consumer_secret,sw_api_key, 
-                    ynab_personal_access_token, ynab_budget_name, ynab_account_name,
-                 use_update_date: bool=False) -> None:
+    def __init__(self, sw_consumer_key, sw_consumer_secret, sw_api_key,
+                 ynab_personal_access_token, ynab_budget_name, ynab_account_name,
+                 use_update_date: bool = False) -> None:
         self.sw = SW(sw_consumer_key, sw_consumer_secret, sw_api_key)
         self.ynab = YNABClient(ynab_personal_access_token)
 
@@ -95,12 +95,25 @@ class ynab_splitwise_transfer():
         if not expenses:
             self.logger.info("No transactions to write to YNAB.")
             return 0
-        earliest_splitwise_date = min([datetime.strptime(expense['date'], "%Y-%m-%dT%H:%M:%SZ").date() for expense in expenses])
+
+        # Filter out expenses without dates and log them
+        valid_expenses = []
+        for expense in expenses:
+            if 'date' not in expense:
+                self.logger.warning(f"Skipping expense without date: {expense.get('description', 'No description')} ID: {expense.get('id', 'No ID')}")
+                continue
+            valid_expenses.append(expense)
+
+        if not valid_expenses:
+            self.logger.info("No valid transactions with dates to write to YNAB.")
+            return 0
+
+        earliest_splitwise_date = min([datetime.strptime(expense['date'], "%Y-%m-%dT%H:%M:%SZ").date() for expense in valid_expenses])
         swid_to_transaction_mapping = self.ynab_swid_to_transaction_mapping(since_date=earliest_splitwise_date)
         ynab_transactions = []
         scheduled_transactions = []
         updated_transactions = []
-        for expense in expenses:
+        for expense in valid_expenses:
             # don't import deleted expenses
             if expense['deleted_time']:
                 _, expense_swid, _ = extract_swid_from_memo(expense['swid'])
