@@ -39,7 +39,7 @@ class TestYnabSplitwiseTransfer(unittest.TestCase):
         older_expense = MockExpense(
             date='2025-06-01T10:00:00Z',
             description='Test Expense',
-            swid='splitwise Test Expense SW:12345:ABCDE',  # Same swid, full memo format
+            swid='[SWID:12345-ABCDE]',  # Same expense ID as the newer expense
             cost=100.0,
             owed=50.0,
             deleted_time=None,
@@ -50,7 +50,7 @@ class TestYnabSplitwiseTransfer(unittest.TestCase):
         newer_expense = MockExpense(
             date='2025-06-02T10:00:00Z',
             description='Test Expense Updated',
-            swid='splitwise Test Expense Updated SW:12345:ABCDE',  # Same swid, full memo format
+            swid='[SWID:12345-FGHIJ]',  # Same expense ID, newer updated-time hash
             cost=120.0,
             owed=60.0,
             deleted_time=None,
@@ -95,12 +95,68 @@ class TestYnabSplitwiseTransfer(unittest.TestCase):
         self.assertIn(newer_expense['description'], created_transaction['memo'])
         self.assertIn(newer_expense['swid'], created_transaction['memo'])
 
+    def _run_sync_for_expense(self, expense):
+        """Helper: run sw_to_ynab for a single expense and return the created transaction"""
+        expense.users = [MockUser()]
+        expense._data['users'] = ['Test Friend']  # names list used by the non-payer branch
+        self.mock_sw_instance.get_expenses.return_value = [expense]
+        self.transfer.ynab_swid_to_transaction_mapping = MagicMock(return_value={})
+        self.mock_ynab_instance.create_transaction = MagicMock()
+        self.mock_ynab_instance.create_import_id = MagicMock(return_value="test_import_id")
+
+        self.transfer.sw_to_ynab()
+
+        create_transaction_calls = self.mock_ynab_instance.create_transaction.call_args_list
+        self.assertEqual(len(create_transaction_calls), 1, "One batch of transactions should be created")
+        created_transactions = create_transaction_calls[0][0][1]
+        self.assertEqual(len(created_transactions), 1, "Only one transaction should be in the batch")
+        return created_transactions[0]
+
+    def test_shared_expense_paid_by_other_creates_split(self):
+        """A shared expense someone else paid should keep the split breakdown"""
+        expense = MockExpense(
+            date='2025-06-01T10:00:00Z',
+            description='Shared Dinner',
+            swid='[SWID:23456-ABCDE]',
+            cost=100.0,
+            owed=50.0,  # cost differs from user's share -> breakdown is meaningful
+            deleted_time=None,
+            current_user_paid=False,
+            group_name='Test Group'
+        )
+        transaction = self._run_sync_for_expense(expense)
+
+        # amount is what the current user owes (outflow)
+        self.assertEqual(transaction['amount'], -50000)
+        self.assertIn('subtransactions', transaction)
+        subtransactions = transaction['subtransactions']
+        self.assertEqual(len(subtransactions), 2)
+        self.assertEqual(subtransactions[0]['amount'], -100000)  # Total Cost
+        self.assertEqual(subtransactions[1]['amount'], 50000)    # What others owe
+
+    def test_one_way_transfer_creates_simple_transaction(self):
+        """A one-way transfer (e.g. a settle-up payment received) should not be a split"""
+        expense = MockExpense(
+            date='2025-06-01T10:00:00Z',
+            description='Payment',
+            swid='[SWID:34567-ABCDE]',
+            cost=75.0,
+            owed=0.0,  # pure transfer: what others owe is zero
+            deleted_time=None,
+            current_user_paid=False,
+            group_name='Test Group'
+        )
+        transaction = self._run_sync_for_expense(expense)
+
+        self.assertEqual(transaction['amount'], -75000)
+        self.assertNotIn('subtransactions', transaction)
+
     def test_different_expenses_processed_independently(self):
         """Test that two different expenses are processed independently"""
         expense1 = MockExpense(
             date='2025-06-01T10:00:00Z',
             description='Test Expense 1',
-            swid='splitwise Test Expense 1 SW:12345:ABCDE',  # Full memo format
+            swid='[SWID:12345-ABCDE]',
             cost=100.0,
             owed=50.0,
             deleted_time=None,
@@ -111,7 +167,7 @@ class TestYnabSplitwiseTransfer(unittest.TestCase):
         expense2 = MockExpense(
             date='2025-06-01T10:00:00Z',
             description='Test Expense 2',
-            swid='splitwise Test Expense 2 SW:12345:FGHIJ',  # Full memo format
+            swid='[SWID:67890-FGHIJ]',  # Different expense ID
             cost=120.0,
             owed=60.0,
             deleted_time=None,

@@ -12,7 +12,8 @@ class MockExpense:
             'deleted_time': deleted_time,
             'current_user_paid': current_user_paid,
             'group_name': group_name,
-            'id': swid.split(":")[1] if swid else None,
+            # swid format is [SWID:<id>-<hash>], extract the numeric expense ID
+            'id': swid.split(":")[1].split("-")[0] if swid else None,
             'creation_method': 'equal'
         }
         self.users = []  # Will be set in test

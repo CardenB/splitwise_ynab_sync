@@ -258,7 +258,22 @@ class ynab_splitwise_transfer:
                     "payee_name": (
                         expense["group_name"] if expense["group_name"] else "Splitwise"
                     ),
-                    "subtransactions": [
+                    "memo": " ".join(
+                        [
+                            expense["description"].strip(),
+                            "with",
+                            combine_names(expense["users"]),
+                        ]
+                    ),
+                    "cleared": "cleared",
+                }
+                # Only split when the breakdown is meaningful, i.e. the total cost differs
+                # from what the current user owes. For one-way transfers (settle-up
+                # payments, debt consolidation, or an expense entirely for the current
+                # user), what_i_am_owed is 0 and the split would just be
+                # "Total Cost + $0", so a simple transaction is clearer.
+                if int(what_i_am_owed) != 0:
+                    transaction["subtransactions"] = [
                         {
                             "amount": int(total_cost),
                             "payee_name": expense["description"],
@@ -269,16 +284,7 @@ class ynab_splitwise_transfer:
                             "payee_name": combine_names(expense["users"]),
                             "memo": "What others owe.",
                         },
-                    ],
-                    "memo": " ".join(
-                        [
-                            expense["description"].strip(),
-                            "with",
-                            combine_names(expense["users"]),
-                        ]
-                    ),
-                    "cleared": "cleared",
-                }
+                    ]
             if expense.get("swid", ""):
                 transaction["memo"] = f"{transaction['memo']} {expense['swid']}"
 
