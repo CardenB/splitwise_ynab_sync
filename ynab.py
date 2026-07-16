@@ -18,7 +18,26 @@ class YNABClient:
 
     def _make_request(self, method, endpoint, params=None, data=None):
         url = f"{self.BASE_URL}/{endpoint}"
-        response = requests.request(method, url, headers=self.headers, params=params, json=data)
+        # Explicit timeout (connect, read) so a stalled YNAB connection fails
+        # fast instead of hanging until systemd's TimeoutStartSec kills the
+        # run. One retry for transient timeouts/connection drops; HTTP errors
+        # (4xx/5xx) still raise immediately via raise_for_status.
+        last_exc = None
+        for attempt in range(2):
+            try:
+                response = requests.request(
+                    method, url, headers=self.headers, params=params, json=data,
+                    timeout=(10, 120),
+                )
+                break
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last_exc = exc
+                self.logger.warning(
+                    "YNAB request %s %s failed (%s), attempt %d/2",
+                    method, endpoint, exc.__class__.__name__, attempt + 1,
+                )
+        else:
+            raise last_exc
         response.raise_for_status()  # Raise an exception for HTTP errors
         return response.json()
 
