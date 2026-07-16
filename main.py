@@ -2,6 +2,7 @@ import json
 import os
 import logging
 import secrets
+import socket
 import sys
 from datetime import datetime, timedelta, date, timezone
 from typing import Optional
@@ -513,6 +514,11 @@ def run_for_secrets_dict(secrets_dict: dict) -> int:
 
 
 if __name__ == "__main__":
+    # Global network timeout: the splitwise SDK issues requests with no
+    # timeout, so a stalled connection hangs the run until systemd kills it
+    # (observed 2026-07-16). This is the safety net for any client that
+    # doesn't set its own explicit timeout.
+    socket.setdefaulttimeout(120)
     # load environment variables from yaml file (locally)
     setup_environment_vars()
     ret = 0
