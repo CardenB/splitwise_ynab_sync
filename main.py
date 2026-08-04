@@ -240,10 +240,16 @@ class ynab_splitwise_transfer:
             self.logger.info(
                 f"Importing Splitwise expense {expense['date']} {expense['description']} {expense['swid']}"
             )
+            # Splitwise hands back a full ISO timestamp, but YNAB's transaction
+            # `date` must be a plain YYYY-MM-DD. The API tolerated the timestamp
+            # until 2026-08-01, then began rejecting the whole batch with
+            # "date must be formatted as YYYY-MM-DD".
+            transaction_date = datetime.strptime(expense["date"], "%Y-%m-%dT%H:%M:%SZ")
+            transaction_date_str = transaction_date.strftime("%Y-%m-%d")
             if expense["current_user_paid"]:
                 transaction = {
                     "account_id": self.ynab_account_id,
-                    "date": expense["date"],
+                    "date": transaction_date_str,
                     "amount": int(what_i_am_owed),
                     "payee_name": (
                         expense["group_name"] if expense["group_name"] else "Splitwise"
@@ -254,7 +260,7 @@ class ynab_splitwise_transfer:
             else:
                 transaction = {
                     "account_id": self.ynab_account_id,
-                    "date": expense["date"],
+                    "date": transaction_date_str,
                     "amount": int(what_i_paid),
                     "payee_name": (
                         expense["group_name"] if expense["group_name"] else "Splitwise"
@@ -289,18 +295,14 @@ class ynab_splitwise_transfer:
             if expense.get("swid", ""):
                 transaction["memo"] = f"{transaction['memo']} {expense['swid']}"
 
-            import_id_date = datetime.strptime(
-                expense["date"], "%Y-%m-%dT%H:%M:%SZ"
-            ).strftime("%Y-%m-%d")
             # Generate a random 4-byte hex string for the import hash
             import_hash = secrets.token_hex(4)
             transaction["import_id"] = self.ynab.create_import_id(
                 amount=transaction["amount"],
-                date=import_id_date,
+                date=transaction_date_str,
                 import_hash=import_hash,
             )
 
-            transaction_date = datetime.strptime(expense["date"], "%Y-%m-%dT%H:%M:%SZ")
             if transaction_date > datetime.now():
                 # Scheduled transactions get uncleared.
                 # TODO(carden): Make sure status is updated to cleared once the date passes.

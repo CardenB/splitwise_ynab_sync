@@ -90,7 +90,11 @@ class TestYnabSplitwiseTransfer(unittest.TestCase):
 
         # Verify the transaction details match the newer expense
         created_transaction = created_transactions[0]
-        self.assertEqual(created_transaction['date'], newer_expense['date'])
+        # YNAB requires a plain YYYY-MM-DD date, not Splitwise's ISO timestamp.
+        self.assertEqual(
+            created_transaction['date'],
+            datetime.strptime(newer_expense['date'], "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d"),
+        )
         self.assertEqual(created_transaction['amount'], int(newer_expense['owed'] * 1000))
         self.assertIn(newer_expense['description'], created_transaction['memo'])
         self.assertIn(newer_expense['swid'], created_transaction['memo'])
