@@ -1,3 +1,4 @@
+import functools
 import json
 import os
 import logging
@@ -7,6 +8,8 @@ import sys
 from datetime import datetime, timedelta, date, timezone
 from typing import Optional
 
+import requests
+
 from sw import SW
 from ynab import YNABClient
 from utils import (
@@ -15,6 +18,39 @@ from utils import (
     combine_names,
     extract_swid_from_memo,
 )
+
+
+# (connect, read) timeout applied to any HTTP request whose caller didn't set
+# one of its own. Matches the explicit timeout ynab.py already uses.
+DEFAULT_HTTP_TIMEOUT = (10, 120)
+
+
+def install_default_http_timeout(timeout=DEFAULT_HTTP_TIMEOUT):
+    """Give every timeout-less requests call in this process a real timeout.
+
+    socket.setdefaulttimeout() does NOT cover requests: requests resolves its
+    own default of timeout=None into an explicit sock.settimeout(None), which
+    overrides the process-wide socket default and blocks forever. That made
+    the 2026-07-16 socket.setdefaulttimeout() fix a no-op and let the run hang
+    again on 2026-08-11 until systemd's TimeoutStartSec killed it.
+
+    Patching Session.send is the only hook that reaches the splitwise SDK: it
+    builds its Session internally and calls session.send() with no timeout, so
+    there is no parameter to pass. Callers that do set a timeout (ynab.py)
+    keep theirs.
+    """
+    original_send = requests.Session.send
+    if getattr(original_send, "_default_timeout_installed", False):
+        return
+
+    @functools.wraps(original_send)
+    def send(self, request, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = timeout
+        return original_send(self, request, **kwargs)
+
+    send._default_timeout_installed = True
+    requests.Session.send = send
 
 
 def _add_transaction_to_swid_map(swid_transaction_map: dict, transaction: dict) -> None:
@@ -516,10 +552,12 @@ def run_for_secrets_dict(secrets_dict: dict) -> int:
 
 
 if __name__ == "__main__":
-    # Global network timeout: the splitwise SDK issues requests with no
-    # timeout, so a stalled connection hangs the run until systemd kills it
-    # (observed 2026-07-16). This is the safety net for any client that
-    # doesn't set its own explicit timeout.
+    # Network timeouts. The splitwise SDK issues requests with no timeout, so
+    # a stalled connection hangs the run until systemd kills it (observed
+    # 2026-07-16 and again 2026-08-11).
+    install_default_http_timeout()
+    # Secondary net for any raw-socket I/O that doesn't go through requests.
+    # Does NOT cover requests itself -- see install_default_http_timeout.
     socket.setdefaulttimeout(120)
     # load environment variables from yaml file (locally)
     setup_environment_vars()
