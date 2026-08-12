@@ -4,6 +4,9 @@ from splitwise.user import ExpenseUser
 import os
 import logging
 from datetime import datetime
+
+import requests
+
 from utils import construct_memo_swid_tag, setup_environment_vars
 
 # https://github.com/namaggarwal/splitwise
@@ -52,6 +55,12 @@ class SW():
         self.current_user = get_user_first_and_last_name_with_id(self.sw.getCurrentUser())
         self.current_user_id = self.sw.getCurrentUser().getId()
         self.logger = logging.getLogger(__name__)
+        # Cache group_id -> group name for the life of the run. _expense_group_name
+        # is called twice per expense (debt-consolidation check + dict build), so a
+        # run over N expenses would otherwise issue ~2N getGroup round-trips to
+        # resolve a handful of distinct groups -- every one an uncached, unretried
+        # chance to draw a slow Splitwise handshake and abort the run.
+        self._group_name_cache = {}
 
     def get_friends(self):
         friends_fullnames = []
@@ -115,9 +124,30 @@ class SW():
 
     def _expense_group_name(self, expense) -> str:
         group_id = expense.getGroupId()
-        if group_id is not None and int(group_id) > 0:
-            return self.sw.getGroup(id=group_id).getName()
-        return ''
+        if group_id is None or int(group_id) <= 0:
+            return ''
+        group_id = int(group_id)
+        if group_id not in self._group_name_cache:
+            self._group_name_cache[group_id] = self._fetch_group_name(group_id)
+        return self._group_name_cache[group_id]
+
+    def _fetch_group_name(self, group_id) -> str:
+        # One retry for transient timeouts/connection drops, mirroring ynab.py's
+        # request path. sw.getGroup builds its own Session with no timeout;
+        # main.py's install_default_http_timeout() gives it the process default so
+        # a stall fails fast instead of hanging until systemd's TimeoutStartSec.
+        # This retry absorbs a single such failure before aborting the run.
+        last_exc = None
+        for attempt in range(2):
+            try:
+                return self.sw.getGroup(id=group_id).getName()
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last_exc = exc
+                self.logger.warning(
+                    "Splitwise getGroup(%s) failed (%s), attempt %d/2",
+                    group_id, exc.__class__.__name__, attempt + 1,
+                )
+        raise last_exc
 
     def get_expenses(self, dated_before=None, dated_after=None, use_update: bool=False):
         def _fetch_expenses(offset: int=0):
