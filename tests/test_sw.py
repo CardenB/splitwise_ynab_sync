@@ -153,6 +153,36 @@ class TestSW(unittest.TestCase):
         mock_expense = MockExpense(group_id=None)
         self.assertEqual(self.sw._expense_group_name(mock_expense), "")
 
+    def test_expense_group_name_is_cached(self):
+        """_expense_group_name resolves each group_id once, then serves from cache."""
+        mock_group = MagicMock()
+        mock_group.getName.return_value = "Test Group"
+        self.mock_splitwise.getGroup.return_value = mock_group
+
+        # Two expenses in the same group -> one round-trip, not two.
+        self.assertEqual(self.sw._expense_group_name(MockExpense(group_id="123")), "Test Group")
+        self.assertEqual(self.sw._expense_group_name(MockExpense(group_id="123")), "Test Group")
+        self.mock_splitwise.getGroup.assert_called_once_with(id=123)
+
+    def test_fetch_group_name_retries_once_on_timeout(self):
+        """A single transient timeout is retried; the second success is returned."""
+        import requests
+        mock_group = MagicMock()
+        mock_group.getName.return_value = "Test Group"
+        self.mock_splitwise.getGroup.side_effect = [requests.Timeout("boom"), mock_group]
+
+        self.assertEqual(self.sw._expense_group_name(MockExpense(group_id="123")), "Test Group")
+        self.assertEqual(self.mock_splitwise.getGroup.call_count, 2)
+
+    def test_fetch_group_name_reraises_after_retry_exhausted(self):
+        """Two consecutive timeouts exhaust the retry and re-raise."""
+        import requests
+        self.mock_splitwise.getGroup.side_effect = requests.Timeout("boom")
+
+        with self.assertRaises(requests.Timeout):
+            self.sw._expense_group_name(MockExpense(group_id="123"))
+        self.assertEqual(self.mock_splitwise.getGroup.call_count, 2)
+
     def test_get_friends(self):
         """Test get_friends method"""
         mock_friends = [
