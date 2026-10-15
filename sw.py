@@ -1,8 +1,10 @@
 from splitwise import Splitwise
+from splitwise.exception import SplitwiseException
 from splitwise.expense import Expense
 from splitwise.user import ExpenseUser
 import os
 import logging
+import time
 from datetime import datetime
 
 import requests
@@ -10,6 +12,38 @@ import requests
 from utils import construct_memo_swid_tag, setup_environment_vars
 
 # https://github.com/namaggarwal/splitwise
+
+# Retry policy for Splitwise reads. The hourly timer is the real retry loop;
+# these only absorb a single blip (TLS handshake stall, gateway 5xx) so it
+# doesn't fail the whole run. Kept deliberately small to stay polite to
+# Splitwise's rate limiting:
+# - at most SPLITWISE_ATTEMPTS tries per call, with real backoff between them;
+# - a per-run retry budget so a struggling API can't cascade into dozens of
+#   retries across pages/groups;
+# - 429 honours Retry-After, but gives up rather than waiting past the cap;
+# - other 4xx (auth, bad request, not found) are never retried.
+SPLITWISE_ATTEMPTS = 3
+SPLITWISE_BACKOFF_SECONDS = (10, 30)
+SPLITWISE_RETRY_BUDGET = 4
+SPLITWISE_MAX_RETRY_AFTER_SECONDS = 60
+
+
+def _splitwise_http_status(exc):
+    # splitwise 3.0.0 stores http_status as a 1-tuple (trailing comma in
+    # SplitwiseException.__init__), so unwrap it.
+    status = getattr(exc, "http_status", None)
+    if isinstance(status, tuple):
+        status = status[0] if status else None
+    return status
+
+
+def _retry_after_seconds(exc):
+    headers = getattr(exc, "http_headers", None) or {}
+    try:
+        return float(headers.get("Retry-After"))
+    except (TypeError, ValueError):
+        return None
+
 
 def get_user_first_and_last_name_as_id(user) -> str:
     """
@@ -52,9 +86,12 @@ class SW():
         self.sw = Splitwise(consumer_key, consumer_secret, api_key=api_key)
 
         self.limit = 50
-        self.current_user = get_user_first_and_last_name_with_id(self.sw.getCurrentUser())
-        self.current_user_id = self.sw.getCurrentUser().getId()
         self.logger = logging.getLogger(__name__)
+        self._sleep = time.sleep
+        self._retry_budget = SPLITWISE_RETRY_BUDGET
+        current_user = self._call_splitwise("getCurrentUser", self.sw.getCurrentUser)
+        self.current_user = get_user_first_and_last_name_with_id(current_user)
+        self.current_user_id = current_user.getId()
         # Cache group_id -> group name for the life of the run. _expense_group_name
         # is called twice per expense (debt-consolidation check + dict build), so a
         # run over N expenses would otherwise issue ~2N getGroup round-trips to
@@ -132,22 +169,53 @@ class SW():
         return self._group_name_cache[group_id]
 
     def _fetch_group_name(self, group_id) -> str:
-        # One retry for transient timeouts/connection drops, mirroring ynab.py's
-        # request path. sw.getGroup builds its own Session with no timeout;
-        # main.py's install_default_http_timeout() gives it the process default so
-        # a stall fails fast instead of hanging until systemd's TimeoutStartSec.
-        # This retry absorbs a single such failure before aborting the run.
-        last_exc = None
-        for attempt in range(2):
+        return self._call_splitwise(
+            f"getGroup({group_id})",
+            lambda: self.sw.getGroup(id=group_id).getName(),
+        )
+
+    def _retry_delay(self, exc, attempt):
+        """Seconds to wait before retrying after exc, or None if not retryable.
+
+        sw SDK calls build their own Session with no timeout; main.py's
+        install_default_http_timeout() makes a stall fail fast as
+        requests.Timeout, which lands here.
+        """
+        if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+            return SPLITWISE_BACKOFF_SECONDS[attempt]
+        if isinstance(exc, SplitwiseException):
+            status = _splitwise_http_status(exc)
+            if status == 429:
+                retry_after = _retry_after_seconds(exc)
+                if retry_after is None:
+                    return SPLITWISE_BACKOFF_SECONDS[attempt]
+                if retry_after > SPLITWISE_MAX_RETRY_AFTER_SECONDS:
+                    return None
+                return retry_after
+            if status is not None and 500 <= status < 600:
+                return SPLITWISE_BACKOFF_SECONDS[attempt]
+        return None
+
+    def _call_splitwise(self, label, fn):
+        """Call fn(), retrying transient Splitwise failures per the policy above."""
+        for attempt in range(SPLITWISE_ATTEMPTS):
             try:
-                return self.sw.getGroup(id=group_id).getName()
-            except (requests.Timeout, requests.ConnectionError) as exc:
-                last_exc = exc
+                return fn()
+            except (requests.Timeout, requests.ConnectionError, SplitwiseException) as exc:
+                status = _splitwise_http_status(exc)
+                delay = self._retry_delay(exc, attempt) if attempt + 1 < SPLITWISE_ATTEMPTS else None
+                if delay is not None and self._retry_budget <= 0:
+                    self.logger.warning("Splitwise retry budget exhausted for this run.")
+                    delay = None
                 self.logger.warning(
-                    "Splitwise getGroup(%s) failed (%s), attempt %d/2",
-                    group_id, exc.__class__.__name__, attempt + 1,
+                    "Splitwise %s failed (%s, http_status=%s), attempt %d/%d%s",
+                    label, exc.__class__.__name__, status, attempt + 1, SPLITWISE_ATTEMPTS,
+                    f"; retrying in {delay:g}s" if delay is not None else "; giving up",
                 )
-        raise last_exc
+                if delay is None:
+                    raise
+                self._retry_budget -= 1
+                self._sleep(delay)
 
     def get_expenses(self, dated_before=None, dated_after=None, use_update: bool=False):
         def _fetch_expenses(offset: int=0):
@@ -165,7 +233,10 @@ class SW():
                 kwargs['dated_after'] = dated_after
                 if dated_before is not None:
                     kwargs['dated_before'] = dated_before
-            return self.sw.getExpenses(**kwargs)
+            return self._call_splitwise(
+                f"getExpenses(offset={offset})",
+                lambda: self.sw.getExpenses(**kwargs),
+            )
         cur_offset = 0
         cur_expenses = _fetch_expenses()
         while cur_expenses:

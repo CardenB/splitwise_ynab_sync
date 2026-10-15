@@ -4,8 +4,19 @@ from sw import (
     get_user_first_and_last_name_as_id,
     get_user_first_and_last_name,
     get_user_first_and_last_name_with_id,
-    SW
+    SW,
+    SPLITWISE_ATTEMPTS,
+    SPLITWISE_BACKOFF_SECONDS,
+    SPLITWISE_MAX_RETRY_AFTER_SECONDS,
 )
+import requests
+from splitwise.exception import SplitwiseException, SplitwiseUnauthorizedException
+
+
+def _sw_error(status, cls=SplitwiseException, headers=None):
+    """Build the exception the splitwise SDK raises for an HTTP status."""
+    response = MagicMock(status_code=status, content=b"", headers=headers or {})
+    return cls("Unknown error happened", response)
 
 class MockUser:
     def __init__(self, id=None, first_name=None, last_name=None):
@@ -96,6 +107,8 @@ class TestSW(unittest.TestCase):
         
         with patch('sw.Splitwise', return_value=self.mock_splitwise):
             self.sw = SW("key", "secret", "api_key")
+        # Never really sleep through retry backoff in tests.
+        self.sw._sleep = MagicMock()
 
     def test_expense_involves_current_user(self):
         """Test _expense_involves_current_user method"""
@@ -164,24 +177,76 @@ class TestSW(unittest.TestCase):
         self.assertEqual(self.sw._expense_group_name(MockExpense(group_id="123")), "Test Group")
         self.mock_splitwise.getGroup.assert_called_once_with(id=123)
 
-    def test_fetch_group_name_retries_once_on_timeout(self):
-        """A single transient timeout is retried; the second success is returned."""
-        import requests
+    def test_init_fetches_current_user_once(self):
+        """SW() resolves the current user with a single getCurrentUser call."""
+        self.assertEqual(self.mock_splitwise.getCurrentUser.call_count, 1)
+        self.assertEqual(self.sw.current_user_id, "123")
+
+    def test_fetch_group_name_retries_on_timeout(self):
+        """A transient timeout is retried after a backoff; the success is returned."""
         mock_group = MagicMock()
         mock_group.getName.return_value = "Test Group"
         self.mock_splitwise.getGroup.side_effect = [requests.Timeout("boom"), mock_group]
 
         self.assertEqual(self.sw._expense_group_name(MockExpense(group_id="123")), "Test Group")
         self.assertEqual(self.mock_splitwise.getGroup.call_count, 2)
+        self.sw._sleep.assert_called_once_with(SPLITWISE_BACKOFF_SECONDS[0])
 
-    def test_fetch_group_name_reraises_after_retry_exhausted(self):
-        """Two consecutive timeouts exhaust the retry and re-raise."""
-        import requests
+    def test_fetch_group_name_reraises_after_attempts_exhausted(self):
+        """Consecutive timeouts exhaust the attempts and re-raise."""
+        self.mock_splitwise.getGroup.side_effect = requests.Timeout("boom")
+
+        with self.assertRaises(requests.Timeout):
+            self.sw._expense_group_name(MockExpense(group_id="123"))
+        self.assertEqual(self.mock_splitwise.getGroup.call_count, SPLITWISE_ATTEMPTS)
+        self.assertEqual(self.sw._sleep.call_count, SPLITWISE_ATTEMPTS - 1)
+
+    def test_get_expenses_retries_on_5xx(self):
+        """An 'Unknown error' (gateway 5xx) from getExpenses is retried, not fatal."""
+        self.mock_splitwise.getExpenses.side_effect = [_sw_error(504), []]
+
+        self.assertEqual(list(self.sw.get_expenses(dated_after="2026-01-01")), [])
+        self.assertEqual(self.mock_splitwise.getExpenses.call_count, 2)
+        self.sw._sleep.assert_called_once_with(SPLITWISE_BACKOFF_SECONDS[0])
+
+    def test_get_expenses_does_not_retry_auth_errors(self):
+        """4xx other than 429 is a real error: no retry, no sleep."""
+        self.mock_splitwise.getExpenses.side_effect = _sw_error(
+            401, cls=SplitwiseUnauthorizedException)
+
+        with self.assertRaises(SplitwiseUnauthorizedException):
+            list(self.sw.get_expenses(dated_after="2026-01-01"))
+        self.assertEqual(self.mock_splitwise.getExpenses.call_count, 1)
+        self.sw._sleep.assert_not_called()
+
+    def test_429_honours_retry_after(self):
+        """429 waits for the server's Retry-After before the single retry."""
+        self.mock_splitwise.getExpenses.side_effect = [
+            _sw_error(429, headers={"Retry-After": "7"}), []]
+
+        list(self.sw.get_expenses(dated_after="2026-01-01"))
+        self.sw._sleep.assert_called_once_with(7.0)
+
+    def test_429_with_long_retry_after_gives_up(self):
+        """A Retry-After past the cap means back off entirely, not hammer the API."""
+        self.mock_splitwise.getExpenses.side_effect = _sw_error(
+            429, headers={"Retry-After": str(SPLITWISE_MAX_RETRY_AFTER_SECONDS + 1)})
+
+        with self.assertRaises(SplitwiseException):
+            list(self.sw.get_expenses(dated_after="2026-01-01"))
+        self.assertEqual(self.mock_splitwise.getExpenses.call_count, 1)
+        self.sw._sleep.assert_not_called()
+
+    def test_retry_budget_caps_retries_per_run(self):
+        """Once the per-run budget is spent, further failures raise immediately."""
+        self.sw._retry_budget = 1
         self.mock_splitwise.getGroup.side_effect = requests.Timeout("boom")
 
         with self.assertRaises(requests.Timeout):
             self.sw._expense_group_name(MockExpense(group_id="123"))
         self.assertEqual(self.mock_splitwise.getGroup.call_count, 2)
+        self.assertEqual(self.sw._sleep.call_count, 1)
+        self.assertEqual(self.sw._retry_budget, 0)
 
     def test_get_friends(self):
         """Test get_friends method"""
