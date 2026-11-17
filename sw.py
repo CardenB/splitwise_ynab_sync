@@ -1,11 +1,12 @@
 from splitwise import Splitwise
-from splitwise.exception import SplitwiseException
+from splitwise.exception import SplitwiseException, SplitwiseNotFoundException
 from splitwise.expense import Expense
 from splitwise.user import ExpenseUser
 import os
 import logging
 import time
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 
 import requests
 
@@ -363,6 +364,46 @@ class SW():
                     marker_map.setdefault(transaction_id, expense.getId())
             offset += self.limit
         return marker_map
+
+    def get_expense(self, expense_id):
+        """Fetch one expense by id (retried). Returns None if Splitwise says 404."""
+        try:
+            return self._call_splitwise(
+                f"getExpense({expense_id})",
+                lambda: self.sw.getExpense(int(expense_id)),
+            )
+        except SplitwiseNotFoundException:
+            return None
+
+    @staticmethod
+    def expense_shares_cents(expense):
+        """Return (cost_cents, {user_id: (paid_cents, owed_cents)}) for an SDK Expense."""
+        def cents(value):
+            return int((Decimal(str(value or "0")) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        users = {}
+        for user in expense.getUsers() or []:
+            users[int(user.getId())] = (cents(user.getPaidShare()), cents(user.getOwedShare()))
+        return cents(expense.getCost()), users
+
+    def update_expense(self, expense_id, expense):
+        """Update an existing expense in place (NOT retried). Same dict shape
+        as create_expense; Splitwise replaces the users list with the one sent."""
+        e = Expense()
+        e.setId(int(expense_id))
+        e.setCost(expense['cost'])
+        e.setDate(expense['date'])
+        e.setDescription(expense['description'])
+        if expense.get('details'):
+            e.setDetails(expense['details'])
+        users = []
+        for user in expense['users']:
+            u = ExpenseUser()
+            u.setId(user['id'])
+            u.setPaidShare(user['paid'])
+            u.setOwedShare(user['owed'])
+            users.append(u)
+        e.setUsers(users)
+        return self.sw.updateExpense(e)
 
     def create_expense(self, expense):
         """Create a Splitwise expense. NOT retried: a create is not idempotent.

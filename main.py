@@ -2,9 +2,11 @@ import functools
 import json
 import os
 import logging
+import re
 import secrets
 import socket
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
 from typing import Optional
@@ -20,8 +22,9 @@ from utils import (
     extract_swid_from_memo,
     append_memo_tag,
     construct_memo_swexp_tag,
-    construct_ynab_marker,
     extract_swexp_from_memo,
+    extract_split_mode,
+    details_with_marker_and_mode,
 )
 
 
@@ -72,9 +75,12 @@ def _add_transaction_to_swid_map(swid_transaction_map: dict, transaction: dict) 
 # --- YNAB -> Splitwise (flag-driven) -----------------------------------------
 
 YNAB_FLAG_COLORS = ("red", "orange", "yellow", "green", "blue", "purple")
-# YNAB rejects memos longer than this; the original memo is truncated to fit,
-# never the [SWEXP:<id>] tag.
-YNAB_MEMO_MAX_LENGTH = 200
+# SaveTransactionWithOptionalFields.memo maxLength in YNAB's OpenAPI spec
+# (https://api.ynab.com/papi/open_api_spec.yaml). The original memo is
+# truncated to fit, never the [SWEXP:<id>] tag.
+YNAB_MEMO_MAX_LENGTH = 500
+# Default per-budget state directory (gitignored) next to this file.
+DEFAULT_STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".state")
 SPLIT_MODE_HALF = "half"
 SPLIT_MODE_PARTNER_PAYS = "partner_pays"
 _TRUE_STRINGS = ("true", "1", "yes", "on")
@@ -88,8 +94,8 @@ class YnabToSwConfig:
     flag_split: str = "purple"
     flag_partner_pays: Optional[str] = None
     flag_self_pays: Optional[str] = None
-    lookback_days: int = 14
     dry_run: bool = False
+    state_dir: str = DEFAULT_STATE_DIR
 
 
 def _config_value(secrets_dict: dict, key: str):
@@ -165,15 +171,9 @@ def parse_ynab_to_sw_config(secrets_dict: dict):
     if len(set(flags)) != len(flags):
         errors.append("YNAB_TO_SW flag colours must all be different")
 
-    lookback = _config_value(secrets_dict, "YNAB_TO_SW_LOOKBACK_DAYS")
-    if lookback is not None and str(lookback).strip() != "":
-        try:
-            config.lookback_days = int(str(lookback).strip())
-            if config.lookback_days <= 0:
-                raise ValueError
-        except ValueError:
-            errors.append("YNAB_TO_SW_LOOKBACK_DAYS must be a positive integer")
-            config.lookback_days = 14
+    state_dir = _config_value(secrets_dict, "YNAB_TO_SW_STATE_DIR")
+    if state_dir is not None and str(state_dir).strip() != "":
+        config.state_dir = str(state_dir).strip()
 
     if not config.enabled:
         errors = []
@@ -198,6 +198,22 @@ def compute_shares(cost_cents: int, mode: str) -> tuple:
     return cost_cents - partner, partner
 
 
+def expense_request_cents(expense: dict) -> tuple:
+    """(cost_cents, {user_id: (paid_cents, owed_cents)}) for a create/update request."""
+    def cents(text):
+        whole, frac = str(text).split(".")
+        return int(whole) * 100 + int(frac)
+    users = {int(u["id"]): (cents(u["paid"]), cents(u["owed"])) for u in expense["users"]}
+    return cents(expense["cost"]), users
+
+
+def _expense_meta_matches(existing, desired: dict) -> bool:
+    """Same calendar date and description as the desired request."""
+    existing_date = str(existing.getDate() or "")[:10]
+    return (existing_date == desired["date"][:10]
+            and (existing.getDescription() or "").strip() == desired["description"])
+
+
 def build_splitwise_expense(transaction: dict, mode: str, owner_id, partner_id) -> dict:
     """Build the sw.create_expense() request for a flagged YNAB outflow."""
     milliunits = -int(transaction["amount"])
@@ -212,13 +228,60 @@ def build_splitwise_expense(transaction: dict, mode: str, owner_id, partner_id) 
         "cost": _cents_to_str(cost_cents),
         "date": date,
         "description": (transaction.get("payee_name") or "").strip() or "YNAB transaction",
-        "details": construct_ynab_marker(transaction["id"]),
+        "details": details_with_marker_and_mode(None, transaction["id"], mode),
         "group_id": 0,
         "users": [
             {"id": owner_id, "paid": _cents_to_str(cost_cents), "owed": _cents_to_str(owner_owed)},
             {"id": partner_id, "paid": _cents_to_str(0), "owed": _cents_to_str(partner_owed)},
         ],
     }
+
+
+def check_state_dir(state_dir: str) -> Optional[str]:
+    """Create the state dir if needed; return an error string if unusable."""
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+    except OSError as exc:
+        return f"YNAB_TO_SW_STATE_DIR cannot be created ({exc.__class__.__name__})"
+    if not os.path.isdir(state_dir) or not os.access(state_dir, os.W_OK | os.X_OK):
+        return "YNAB_TO_SW_STATE_DIR is not a writable directory"
+    return None
+
+
+def state_path_for_budget(state_dir: str, budget_id: str) -> str:
+    safe = re.sub(r"[^0-9A-Za-z_-]", "_", str(budget_id))
+    return os.path.join(state_dir, f"ynab_to_sw_{safe}.json")
+
+
+def load_state(path: str) -> Optional[dict]:
+    """Return the saved state, or None if there is none yet. Raises on a
+    corrupt file so the run fails safe instead of re-baselining."""
+    if not os.path.exists(path):
+        return None
+    with open(path, "r") as f:
+        state = json.load(f)
+    if not isinstance(state.get("server_knowledge"), int):
+        raise ValueError("state file has no integer server_knowledge")
+    state.setdefault("preexisting_flags", {})
+    return state
+
+
+def save_state(path: str, state: dict) -> None:
+    """Atomically write state (temp file in the same dir + rename)."""
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class ynab_splitwise_transfer:
@@ -549,11 +612,17 @@ class ynab_splitwise_transfer:
     def ynab_to_sw(self, config: "YnabToSwConfig") -> int:
         """Flag-driven YNAB -> Splitwise sync. See README "YNAB -> Splitwise".
 
-        For each outflow in this user's budget flagged with an actionable
-        colour, create (or reuse) a Splitwise expense with the partner, then
-        tag the YNAB memo and clear the flag. Returns 0 on success, 1 if any
-        transaction failed (its flag is left in place for the next run).
+        Uses YNAB delta requests (last_knowledge_of_server) so any transaction
+        flagged since the previous run is picked up regardless of its date.
+        Per-budget state lives in config.state_dir.
 
+        First run for a budget: record a baseline (server_knowledge plus the
+        flags already present) and process nothing. Later runs: process the
+        delta; transactions whose flag was already set at baseline are
+        skipped until that flag changes. State advances only after a run with
+        zero failures that was not a dry run.
+
+        Returns 0 on success, 1 if anything failed (flags left in place).
         Logs carry counts, ids and status only -- never payees, amounts or memos.
         """
         log = self.logger
@@ -561,123 +630,294 @@ class ynab_splitwise_transfer:
             config.flag_split: SPLIT_MODE_HALF,
             config.flag_partner_pays: SPLIT_MODE_PARTNER_PAYS,
         }
-        since = datetime.now().date() - timedelta(days=config.lookback_days)
-        log.info(
-            "YNAB->Splitwise: scanning budget since %s (dry_run=%s).",
-            since.isoformat(), config.dry_run,
-        )
+        state_path = state_path_for_budget(config.state_dir, self.ynab_budget_id)
+        try:
+            state = load_state(state_path)
+        except Exception as exc:
+            log.error("YNAB->Splitwise: state file unreadable (%s); no writes made.",
+                      exc.__class__.__name__)
+            return 1
+
+        if state is None:
+            return self._ynab_to_sw_baseline(state_path)
+
+        knowledge = state["server_knowledge"]
+        preexisting = dict(state["preexisting_flags"])
         try:
             response = self.ynab.get_transactions(
-                self.ynab_budget_id, since_date=since.isoformat()
+                self.ynab_budget_id, last_knowledge_of_server=knowledge
             )
             transactions = response["data"]["transactions"]
+            new_knowledge = int(response["data"]["server_knowledge"])
         except Exception as exc:
-            log.error("YNAB->Splitwise: failed to fetch transactions (%s).",
+            log.error("YNAB->Splitwise: failed to fetch transaction delta (%s).",
                       exc.__class__.__name__)
             return 1
+        log.info("YNAB->Splitwise: %d changed transaction(s) since knowledge %d (dry_run=%s).",
+                 len(transactions), knowledge, config.dry_run)
 
-        counts = {"self_pays": 0, "skipped": 0, "already_tagged": 0}
-        candidates = []
+        counts = {"self_pays": 0, "skipped": 0, "pre_baseline": 0}
+        flagged = []   # (transaction, mode): create, or update in place
+        to_sync = []   # (transaction, expense_id): already associated, no actionable flag
+        orphaned_early = []  # (transaction id, expense id): associated but no longer syncable
         for transaction in transactions:
-            flag = transaction.get("flag_color")
+            flag = transaction.get("flag_color") or None
+            transaction_id = transaction.get("id")
+            memo = transaction.get("memo") or ""
+            if transaction_id in preexisting:
+                if not transaction.get("deleted") and preexisting[transaction_id] == flag:
+                    # Flag predates the baseline; this delta entry is an
+                    # unrelated edit (e.g. reconcile), not a new flag.
+                    counts["pre_baseline"] += 1
+                    continue
+                # Flag changed or row deleted: forget it so a new flag counts.
+                del preexisting[transaction_id]
             if flag == config.flag_self_pays:
+                # Ignored, even if already associated with an expense: the
+                # expense is never changed or deleted automatically.
                 counts["self_pays"] += 1
                 continue
-            if flag not in modes:
+            if (transaction.get("account_id") == self.ynab_account_id
+                    or extract_swid_from_memo(memo)[1] is not None):
+                # Splitwise-account rows / [SWID:] rows belong to sw_to_ynab.
+                if flag in modes:
+                    counts["skipped"] += 1
                 continue
-            if (
-                transaction.get("deleted")
-                or transaction.get("amount", 0) >= 0
-                or transaction.get("transfer_account_id")
-                or transaction.get("subtransactions")
-                or transaction.get("account_id") == self.ynab_account_id
-            ):
-                counts["skipped"] += 1
-                continue
-            memo = transaction.get("memo") or ""
-            if extract_swexp_from_memo(memo) is not None or extract_swid_from_memo(memo)[1] is not None:
-                counts["already_tagged"] += 1
-                continue
-            candidates.append((transaction, modes[flag]))
+            tagged_expense_id = extract_swexp_from_memo(memo)
+            if flag in modes:
+                if (
+                    transaction.get("deleted")
+                    or transaction.get("amount", 0) >= 0
+                    or transaction.get("transfer_account_id")
+                    or transaction.get("subtransactions")
+                ):
+                    counts["skipped"] += 1
+                    continue
+                flagged.append((transaction, modes[flag]))
+            elif tagged_expense_id is not None:
+                # Sync pass: looser eligibility (a later split syncs on its
+                # parent total), but never touch the expense for a deleted,
+                # inflow, zero or transfer row.
+                if (
+                    transaction.get("deleted")
+                    or transaction.get("amount", 0) >= 0
+                    or transaction.get("transfer_account_id")
+                ):
+                    orphaned_early.append((transaction_id, tagged_expense_id))
+                    continue
+                to_sync.append((transaction, tagged_expense_id))
 
         log.info(
-            "YNAB->Splitwise: %d candidate(s); ignored %d self-pays, %d ineligible, %d already tagged.",
-            len(candidates), counts["self_pays"], counts["skipped"], counts["already_tagged"],
+            "YNAB->Splitwise: %d flagged candidate(s), %d associated to sync; ignored %d "
+            "self-pays, %d ineligible, %d flagged before baseline.",
+            len(flagged), len(to_sync), counts["self_pays"], counts["skipped"],
+            counts["pre_baseline"],
         )
-        if not candidates:
-            return 0
 
-        owner_id = self.sw.current_user_id
-        if str(owner_id) == str(config.partner_user_id):
-            log.error("YNAB->Splitwise: partner user id equals the current Splitwise user; aborting.")
-            return 1
+        stats = dict(created=0, updated=0, unchanged=0, synced=0, sync_unchanged=0,
+                     orphaned=0, patched=0, failed=0)
+        for transaction_id, expense_id in orphaned_early:
+            stats["orphaned"] += 1
+            log.warning("YNAB->Splitwise: transaction %s (expense %s) is deleted, an inflow or a "
+                        "transfer now; expense left unchanged.", transaction_id, expense_id)
 
-        try:
-            # Expense dates are the YNAB transaction date (noon UTC); a day of
-            # margin keeps timezone edges inside the window.
-            dated_after = (since - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
-            marker_map = self.sw.get_ynab_marker_expense_ids(dated_after=dated_after)
-        except Exception as exc:
-            log.error("YNAB->Splitwise: failed to read Splitwise expenses (%s); no writes made.",
-                      exc.__class__.__name__)
-            return 1
+        if flagged or to_sync:
+            owner_id = self.sw.current_user_id
+            if str(owner_id) == str(config.partner_user_id):
+                log.error("YNAB->Splitwise: partner user id equals the current Splitwise user; aborting.")
+                return 1
+            marker_map = {}
+            if flagged:
+                try:
+                    earliest = min(
+                        datetime.strptime(t["date"], "%Y-%m-%d").date() for t, _ in flagged
+                    )
+                    # Expenses are dated noon UTC on the YNAB date; a day of
+                    # margin keeps timezone edges inside the window.
+                    dated_after = (earliest - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+                    marker_map = self.sw.get_ynab_marker_expense_ids(dated_after=dated_after)
+                except Exception as exc:
+                    log.error("YNAB->Splitwise: failed to read Splitwise expenses (%s); no writes made.",
+                              exc.__class__.__name__)
+                    return 1
 
-        created = reused = patched = failed = 0
-        for transaction, mode in candidates:
-            transaction_id = transaction["id"]
-            try:
-                expense_request = build_splitwise_expense(
-                    transaction, mode, owner_id, config.partner_user_id
-                )
-                expense_id = marker_map.get(transaction_id)
-                if config.dry_run:
-                    if expense_id is None:
-                        created += 1
-                    else:
-                        reused += 1
-                    continue
-                if expense_id is None:
-                    expense, errors = self.sw.create_expense(expense_request)
-                    if errors or expense is None or not expense.getId():
-                        raise RuntimeError("Splitwise rejected the expense")
-                    expense_id = expense.getId()
-                    marker_map[transaction_id] = expense_id
-                    created += 1
-                    log.info("YNAB->Splitwise: transaction %s -> created expense %s.",
-                             transaction_id, expense_id)
-                else:
-                    reused += 1
-                    log.info("YNAB->Splitwise: transaction %s -> reusing expense %s.",
-                             transaction_id, expense_id)
+            for transaction, mode in flagged:
+                try:
+                    self._ynab_to_sw_flagged(transaction, mode, owner_id, config, marker_map, stats)
+                except Exception as exc:
+                    stats["failed"] += 1
+                    log.error("YNAB->Splitwise: transaction %s failed (%s); flag left in place.",
+                              transaction["id"], exc.__class__.__name__)
+            for transaction, expense_id in to_sync:
+                try:
+                    self._ynab_to_sw_sync(transaction, expense_id, owner_id, config, stats)
+                except Exception as exc:
+                    stats["failed"] += 1
+                    log.error("YNAB->Splitwise: sync of transaction %s (expense %s) failed (%s).",
+                              transaction["id"], expense_id, exc.__class__.__name__)
 
-                # Only memo + flag_color: never send the whole transaction back.
-                self.ynab.update_transactions(
-                    self.ynab_budget_id,
-                    [{
-                        "id": transaction_id,
-                        "memo": append_memo_tag(
-                            transaction.get("memo"),
-                            construct_memo_swexp_tag(expense_id),
-                            YNAB_MEMO_MAX_LENGTH,
-                        ),
-                        "flag_color": None,
-                    }],
-                )
-                patched += 1
-            except Exception as exc:
-                failed += 1
-                log.error(
-                    "YNAB->Splitwise: transaction %s failed (%s); flag left in place.",
-                    transaction_id, exc.__class__.__name__,
-                )
-
+        summary = ("created %d, updated %d, unchanged %d, synced %d, sync-unchanged %d, "
+                   "orphaned %d, YNAB updated %d, failed %d" % (
+                       stats["created"], stats["updated"], stats["unchanged"], stats["synced"],
+                       stats["sync_unchanged"], stats["orphaned"], stats["patched"], stats["failed"]))
         if config.dry_run:
-            log.info("YNAB->Splitwise DRY RUN: would create %d, would reuse %d; no writes made.",
-                     created, reused)
+            log.info("YNAB->Splitwise DRY RUN (would): %s; no writes made, state not advanced.", summary)
+            return 1 if stats["failed"] else 0
+        log.info("YNAB->Splitwise: %s.", summary)
+        if stats["failed"]:
+            log.info("YNAB->Splitwise: state kept at knowledge %d so failures are retried.", knowledge)
+            return 1
+        try:
+            save_state(state_path, {
+                "budget_id": self.ynab_budget_id,
+                "server_knowledge": new_knowledge,
+                "preexisting_flags": preexisting,
+            })
+        except Exception as exc:
+            log.error("YNAB->Splitwise: failed to save state (%s).", exc.__class__.__name__)
+            return 1
+        return 0
+
+    def _load_associated_expense(self, transaction_id, expense_id, owner_id, partner_id, stats):
+        """Fetch the associated expense. Returns None (counted orphaned) if it is
+        deleted or missing; raises if it involves anyone but owner + partner."""
+        existing = self.sw.get_expense(expense_id)
+        if existing is None or existing.getDeletedAt():
+            stats["orphaned"] += 1
+            self.logger.warning(
+                "YNAB->Splitwise: transaction %s is associated with expense %s, which is "
+                "deleted or missing; not recreated.", transaction_id, expense_id)
+            return None
+        _, users = self.sw.expense_shares_cents(existing)
+        if set(users) != {int(owner_id), int(partner_id)}:
+            raise RuntimeError("associated expense has a different set of users")
+        return existing
+
+    def _update_expense_in_place(self, transaction_id, expense_id, existing, desired, mode):
+        desired = dict(desired)
+        desired["details"] = details_with_marker_and_mode(existing.getDetails(), transaction_id, mode)
+        desired.pop("group_id", None)  # leave the expense's group as it is
+        _, errors = self.sw.update_expense(expense_id, desired)
+        if errors:
+            raise RuntimeError("Splitwise rejected the update")
+
+    def _ynab_to_sw_flagged(self, transaction, mode, owner_id, config, marker_map, stats) -> None:
+        """Create, or bring in line, the single expense associated with one
+        flagged transaction, then clear its flag. Raises on failure."""
+        log = self.logger
+        transaction_id = transaction["id"]
+        desired = build_splitwise_expense(transaction, mode, owner_id, config.partner_user_id)
+        memo_expense_id = extract_swexp_from_memo(transaction.get("memo"))
+        marker_expense_id = marker_map.get(transaction_id)
+        if (memo_expense_id is not None and marker_expense_id is not None
+                and int(memo_expense_id) != int(marker_expense_id)):
+            log.warning("YNAB->Splitwise: transaction %s memo tag names expense %s but marker "
+                        "names %s; using the memo tag.",
+                        transaction_id, memo_expense_id, marker_expense_id)
+        expense_id = memo_expense_id if memo_expense_id is not None else marker_expense_id
+
+        if expense_id is None:
+            if config.dry_run:
+                stats["created"] += 1
+                return
+            expense, errors = self.sw.create_expense(desired)
+            if errors or expense is None or not expense.getId():
+                raise RuntimeError("Splitwise rejected the expense")
+            expense_id = expense.getId()
+            marker_map[transaction_id] = expense_id
+            stats["created"] += 1
+            log.info("YNAB->Splitwise: transaction %s -> created expense %s.",
+                     transaction_id, expense_id)
         else:
-            log.info("YNAB->Splitwise: created %d, reused %d, YNAB updated %d, failed %d.",
-                     created, reused, patched, failed)
-        return 1 if failed else 0
+            existing = self._load_associated_expense(
+                transaction_id, expense_id, owner_id, config.partner_user_id, stats)
+            if existing is None:
+                return  # orphaned: flag left in place, not a failure
+            existing_cost, existing_users = self.sw.expense_shares_cents(existing)
+            desired_cost, desired_users = expense_request_cents(desired)
+            if (existing_cost == desired_cost and existing_users == desired_users
+                    and _expense_meta_matches(existing, desired)):
+                stats["unchanged"] += 1
+                log.info("YNAB->Splitwise: transaction %s -> expense %s already matches.",
+                         transaction_id, expense_id)
+            else:
+                stats["updated"] += 1
+                if config.dry_run:
+                    return
+                self._update_expense_in_place(transaction_id, expense_id, existing, desired, mode)
+                log.info("YNAB->Splitwise: transaction %s -> updated expense %s.",
+                         transaction_id, expense_id)
+            if config.dry_run:
+                return
+
+        # Only flag_color (+ memo when the tag is missing): never the whole transaction.
+        patch_fields = {"id": transaction_id, "flag_color": None}
+        if memo_expense_id is None:
+            patch_fields["memo"] = append_memo_tag(
+                transaction.get("memo"), construct_memo_swexp_tag(expense_id), YNAB_MEMO_MAX_LENGTH
+            )
+        self.ynab.update_transactions(self.ynab_budget_id, [patch_fields])
+        stats["patched"] += 1
+
+    def _ynab_to_sw_sync(self, transaction, expense_id, owner_id, config, stats) -> None:
+        """Bring an associated (tagged, unflagged) expense in line with later
+        YNAB edits. Writes only when cost, date or description differ, so a
+        manual split adjustment in Splitwise survives unrelated edits. Never
+        writes to YNAB. Raises on failure."""
+        transaction_id = transaction["id"]
+        existing = self._load_associated_expense(
+            transaction_id, expense_id, owner_id, config.partner_user_id, stats)
+        if existing is None:
+            return
+        existing_cost, existing_users = self.sw.expense_shares_cents(existing)
+        mode = extract_split_mode(existing.getDetails())
+        if mode is None:
+            partner_owed = existing_users[int(config.partner_user_id)][1]
+            mode = SPLIT_MODE_PARTNER_PAYS if partner_owed == existing_cost else SPLIT_MODE_HALF
+        # Parent total, even if the transaction has since been split.
+        desired = build_splitwise_expense(transaction, mode, owner_id, config.partner_user_id)
+        desired_cost, _ = expense_request_cents(desired)
+        if existing_cost == desired_cost and _expense_meta_matches(existing, desired):
+            stats["sync_unchanged"] += 1
+            return
+        stats["synced"] += 1
+        if config.dry_run:
+            return
+        self._update_expense_in_place(transaction_id, expense_id, existing, desired, mode)
+        self.logger.info("YNAB->Splitwise: transaction %s edited -> synced expense %s.",
+                         transaction_id, expense_id)
+
+    def _ynab_to_sw_baseline(self, state_path: str) -> int:
+        """First run for this budget: record server_knowledge and the flags
+        already present, process nothing. Saved even in dry-run."""
+        log = self.logger
+        try:
+            # Full read, once: needed to know which transactions are flagged
+            # already so later unrelated edits to them are not treated as new.
+            response = self.ynab.get_transactions(self.ynab_budget_id)
+            transactions = response["data"]["transactions"]
+            knowledge = int(response["data"]["server_knowledge"])
+        except Exception as exc:
+            log.error("YNAB->Splitwise: failed to fetch baseline (%s).", exc.__class__.__name__)
+            return 1
+        preexisting = {
+            t["id"]: t["flag_color"]
+            for t in transactions
+            if t.get("flag_color") and not t.get("deleted")
+        }
+        try:
+            save_state(state_path, {
+                "budget_id": self.ynab_budget_id,
+                "server_knowledge": knowledge,
+                "preexisting_flags": preexisting,
+            })
+        except Exception as exc:
+            log.error("YNAB->Splitwise: failed to save baseline state (%s).", exc.__class__.__name__)
+            return 1
+        log.info("YNAB->Splitwise: no state for this budget; recorded baseline at knowledge %d "
+                 "(%d already-flagged transaction(s) excluded). Nothing processed this run.",
+                 knowledge, len(preexisting))
+        return 0
 
 
 def get_secrets_dict(input_dict: dict) -> dict:
@@ -711,6 +951,10 @@ def run_for_secrets_dict(secrets_dict: dict) -> int:
     # Validate the per-user YNAB -> Splitwise config before touching any API.
     ynab_to_sw_config, ynab_to_sw_errors = parse_ynab_to_sw_config(secrets_dict)
     run_ynab_to_sw = sync_ynab_to_sw and ynab_to_sw_config.enabled
+    if run_ynab_to_sw and not ynab_to_sw_errors:
+        state_error = check_state_dir(ynab_to_sw_config.state_dir)
+        if state_error:
+            ynab_to_sw_errors.append(state_error)
     if run_ynab_to_sw and ynab_to_sw_errors:
         for error in ynab_to_sw_errors:
             logging.getLogger(__name__).error("YNAB->Splitwise config error: %s", error)

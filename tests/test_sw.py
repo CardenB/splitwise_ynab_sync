@@ -129,6 +129,40 @@ class TestSW(unittest.TestCase):
         self.assertEqual(result, {"abc-1": 1})
         self.assertEqual(self.mock_splitwise.getExpenses.call_count, 4)
 
+    def test_get_expense_404_returns_none(self):
+        from splitwise.exception import SplitwiseNotFoundException
+        self.mock_splitwise.getExpense.side_effect = _sw_error(404, SplitwiseNotFoundException)
+        self.assertIsNone(self.sw.get_expense(5))
+        self.assertEqual(self.mock_splitwise.getExpense.call_count, 1)
+
+    def test_get_expense_retries_transient(self):
+        self.mock_splitwise.getExpense.side_effect = [requests.ConnectionError("blip"), "E"]
+        self.assertEqual(self.sw.get_expense("5"), "E")
+        self.mock_splitwise.getExpense.assert_called_with(5)
+
+    def test_expense_shares_cents(self):
+        u1 = MagicMock(); u1.getId.return_value = "1"
+        u1.getPaidShare.return_value = "10.01"; u1.getOwedShare.return_value = "5.01"
+        u2 = MagicMock(); u2.getId.return_value = 2
+        u2.getPaidShare.return_value = "0.0"; u2.getOwedShare.return_value = "5.0"
+        e = MagicMock(); e.getCost.return_value = "10.01"; e.getUsers.return_value = [u1, u2]
+        self.assertEqual(SW.expense_shares_cents(e), (1001, {1: (1001, 501), 2: (0, 500)}))
+
+    def test_update_expense_sends_id_users_and_details(self):
+        self.mock_splitwise.updateExpense.return_value = (MagicMock(), None)
+        self.sw.update_expense(900, {
+            "cost": "12.00", "date": "2026-01-02T12:00:00Z", "description": "d",
+            "details": "ynab:x split:half",
+            "users": [{"id": 1, "paid": "12.00", "owed": "6.00"},
+                      {"id": 2, "paid": "0.00", "owed": "6.00"}],
+        })
+        self.assertEqual(self.mock_splitwise.updateExpense.call_count, 1)
+        e = self.mock_splitwise.updateExpense.call_args.args[0]
+        self.assertEqual(e.getId(), 900)
+        self.assertEqual(e.getCost(), "12.00")
+        self.assertEqual(e.getDetails(), "ynab:x split:half")
+        self.assertEqual([u.getOwedShare() for u in e.getUsers()], ["6.00", "6.00"])
+
     def test_create_expense_sets_details_date_and_group(self):
         self.mock_splitwise.createExpense.return_value = (MagicMock(), None)
         self.sw.create_expense({

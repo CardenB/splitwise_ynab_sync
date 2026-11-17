@@ -148,3 +148,28 @@ def append_memo_tag(memo, tag: str, max_len: int) -> str:
     if len(memo) > room:
         memo = memo[:room].rstrip()
     return f"{memo} {tag}" if memo else tag
+
+
+# Split mode remembered in the Splitwise expense details next to the marker,
+# e.g. "ynab:<transaction id> split:half", so later YNAB edits can be synced
+# with the mode the user originally chose.
+SPLIT_MODE_RE = re.compile(r"\bsplit:(half|partner_pays)\b")
+
+
+def extract_split_mode(details):
+    """Return the stored split mode ('half' / 'partner_pays') or None."""
+    if not details:
+        return None
+    match = SPLIT_MODE_RE.search(details)
+    return match.group(1) if match else None
+
+
+def details_with_marker_and_mode(details, transaction_id: str, mode: str) -> str:
+    """Return details with exactly one `ynab:<id> split:<mode>` entry for this
+    transaction, keeping any other text the user wrote."""
+    text = details or ""
+    text = re.sub(r"[ \t]*" + re.escape(construct_ynab_marker(transaction_id)) + r"\b", "", text)
+    text = SPLIT_MODE_RE.sub("", text)
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    lines.append(f"{construct_ynab_marker(transaction_id)} split:{mode}")
+    return "\n".join(lines)
