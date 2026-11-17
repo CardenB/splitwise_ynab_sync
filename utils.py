@@ -94,3 +94,82 @@ def construct_memo_swid_tag(expense_id: int, updated_at: str):
     """
     short_hash = generate_truncated_hash_for_updated_time(updated_at)
     return f"[SWID:{expense_id}-{short_hash}]"
+
+
+# --- YNAB -> Splitwise (flag-driven) helpers ---------------------------------
+#
+# Tag appended to a YNAB transaction's memo once the flag-driven YNAB ->
+# Splitwise path has created (or found) its Splitwise expense. Deliberately
+# distinct from the [SWID:<id>-<hash>] tag: SWID tags mark rows that
+# sw_to_ynab *imported* into the Splitwise account and carry an updated_at
+# hash that sw_to_ynab uses for change detection. Reusing that format on the
+# originating card transaction would let sw_to_ynab mistake it for one of its
+# own imports (e.g. if the row were ever moved into the Splitwise account).
+SWEXP_TAG_RE = re.compile(r"\[SWEXP:(\d+)\]")
+
+# Marker written into the Splitwise expense's `details` so a rerun can find an
+# expense it already created for a YNAB transaction (idempotency).
+YNAB_MARKER_PREFIX = "ynab:"
+YNAB_MARKER_RE = re.compile(r"ynab:([0-9A-Za-z-]+)")
+
+
+def construct_memo_swexp_tag(expense_id) -> str:
+    return f"[SWEXP:{int(expense_id)}]"
+
+
+def extract_swexp_from_memo(memo):
+    """Return the Splitwise expense id from a [SWEXP:<id>] tag, or None."""
+    if not memo:
+        return None
+    match = SWEXP_TAG_RE.search(memo)
+    return int(match.group(1)) if match else None
+
+
+def construct_ynab_marker(transaction_id: str) -> str:
+    return f"{YNAB_MARKER_PREFIX}{transaction_id}"
+
+
+def extract_ynab_markers(details) -> list:
+    """Return every YNAB transaction id referenced by markers in `details`."""
+    if not details:
+        return []
+    return YNAB_MARKER_RE.findall(details)
+
+
+def append_memo_tag(memo, tag: str, max_len: int) -> str:
+    """Append `tag` to `memo`, truncating the original memo (never the tag)
+    so the result fits in `max_len` characters."""
+    memo = (memo or "").strip()
+    if not memo:
+        return tag
+    room = max_len - len(tag) - 1  # one space separator
+    if room <= 0:
+        return tag
+    if len(memo) > room:
+        memo = memo[:room].rstrip()
+    return f"{memo} {tag}" if memo else tag
+
+
+# Split mode remembered in the Splitwise expense details next to the marker,
+# e.g. "ynab:<transaction id> split:half", so later YNAB edits can be synced
+# with the mode the user originally chose.
+SPLIT_MODE_RE = re.compile(r"\bsplit:(half|partner_pays)\b")
+
+
+def extract_split_mode(details):
+    """Return the stored split mode ('half' / 'partner_pays') or None."""
+    if not details:
+        return None
+    match = SPLIT_MODE_RE.search(details)
+    return match.group(1) if match else None
+
+
+def details_with_marker_and_mode(details, transaction_id: str, mode: str) -> str:
+    """Return details with exactly one `ynab:<id> split:<mode>` entry for this
+    transaction, keeping any other text the user wrote."""
+    text = details or ""
+    text = re.sub(r"[ \t]*" + re.escape(construct_ynab_marker(transaction_id)) + r"\b", "", text)
+    text = SPLIT_MODE_RE.sub("", text)
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    lines.append(f"{construct_ynab_marker(transaction_id)} split:{mode}")
+    return "\n".join(lines)

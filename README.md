@@ -71,6 +71,146 @@ To support multiple users, you can populate key `MULTI_USER_SECRETS_JSON` with a
 ]
 ```
 
+### YNAB -> Splitwise (flag-driven, opt-in)
+
+Each user can push their own shared purchases from YNAB to Splitwise by
+flagging the transaction in **their own budget**. This is off by default. It
+runs only when the global `sync_ynab_to_sw` env var is `true` (its default)
+**and** that user's `YNAB_TO_SW_ENABLED` is `true`.
+
+Three flag meanings, configured per user:
+
+| Flag key | Meaning | What happens |
+| --- | --- | --- |
+| `YNAB_TO_SW_FLAG_SPLIT` (default `purple`) | 50/50 | You paid in full; your partner owes half. An odd cent is owed by you (your partner owes the floor half). |
+| `YNAB_TO_SW_FLAG_PARTNER_PAYS` (required) | partner pays | You paid in full; your partner owes 100%. |
+| `YNAB_TO_SW_FLAG_SELF_PAYS` (required) | you pay | Nothing. The transaction is ignored and the flag is left in place. |
+
+#### Which transactions are picked up
+
+The job reads YNAB **deltas** (`last_knowledge_of_server`), so a transaction is
+picked up when it is flagged, however old it is. State is kept per budget in
+`YNAB_TO_SW_STATE_DIR` as `ynab_to_sw_<budget id>.json`, written atomically.
+
+- **First run for a budget:** records a baseline and processes **nothing**.
+  The baseline is the current server knowledge plus the ids of every
+  transaction that is already flagged. It is saved even in dry run.
+  Already-flagged transactions are never acted on because of a later
+  unrelated edit (for example, reconciling). To act on one, clear its flag
+  and flag it again in a later run.
+- **Later runs:** only transactions changed since the saved knowledge are
+  considered. State advances only after a run with no failures that is not a
+  dry run. Otherwise the same changes are seen again next run.
+
+#### What happens to a flagged transaction
+
+A transaction is only acted on if it is an outflow and is not a transfer, a
+split (subtransactions), deleted, in the Splitwise account, or tagged
+`[SWID:...]` (rows imported by the Splitwise -> YNAB direction).
+
+A transaction is **associated** with a Splitwise expense if its memo has
+`[SWEXP:<id>]`, or if a non-deleted expense's details contain
+`ynab:<transaction id>`. There is never more than one expense per transaction.
+
+1. **Not associated:** a Splitwise expense is created between you and
+   `SW_PARTNER_USER_ID`.
+   - Description: the payee.
+   - Date: the YNAB transaction date.
+   - Details: `ynab:<transaction id> split:<half|partner_pays>`.
+2. **Associated:** the existing expense is brought in line instead. If cost,
+   both users' paid/owed amounts, date and description already match, there is
+   no Splitwise write. Otherwise the same expense is updated in place, so
+   re-flagging 50/50 as partner-pays updates the existing expense.
+3. YNAB is then updated with **only** `flag_color: null`, plus the memo tag
+   ` [SWEXP:<expense id>]` if it was missing. If the memo would exceed YNAB's
+   500-character limit, the original memo is truncated; the tag never is.
+   Category, amount and splits are untouched.
+
+#### Edits after the flag is cleared (sync)
+
+Later edits to a tagged transaction that has no actionable flag also update
+its expense; you don't need to flag it again.
+
+- The split mode stored in the expense details is used. If it is missing, it
+  is inferred: if the partner owes the full cost, it is partner-pays;
+  otherwise 50/50.
+- If cost, date and description all match, nothing is written. A manual split
+  adjustment made in Splitwise therefore survives unrelated YNAB edits such as
+  memo or category changes. If the cost changes, the shares are recomputed
+  from the mode.
+- A transaction that has since been split into subtransactions syncs on its
+  parent total.
+- The sync pass never writes to YNAB.
+
+#### When an expense can't be updated
+
+- **Orphaned (warning only, the run does not fail):** the associated expense
+  was deleted in Splitwise or no longer exists, or the YNAB transaction was
+  deleted or is now an inflow, zero or a transfer. The expense is never
+  recreated, changed or deleted, and a flagged transaction keeps its flag.
+- **Failure:** an expense with any users other than you and your partner, or
+  any API error. The flag is left in place, other transactions still run, the
+  job exits non-zero, and state is not advanced so the transaction is retried.
+  A failure or bad config for one user never stops other users.
+
+The self-pays flag on an already-associated transaction is ignored too: the
+expense is **not** deleted automatically. Delete it in Splitwise yourself if
+you no longer want it.
+
+#### Configuration
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `YNAB_TO_SW_ENABLED` | `false` | Opt-in per user. |
+| `SW_PARTNER_USER_ID` | - | Your partner's numeric Splitwise user id. Required when enabled. |
+| `YNAB_TO_SW_FLAG_SPLIT` | `purple` | |
+| `YNAB_TO_SW_FLAG_PARTNER_PAYS` | - | Required when enabled. |
+| `YNAB_TO_SW_FLAG_SELF_PAYS` | - | Required when enabled. |
+| `YNAB_TO_SW_STATE_DIR` | `.state/` next to `main.py` (gitignored) | Must be writable. State files are per budget, so users can share the directory. |
+| `YNAB_TO_SW_DRY_RUN` | `false` | Reads and plans only. Logs counts, writes nothing to YNAB or Splitwise, and never advances state past the baseline. |
+
+Colours are YNAB's: `red`, `orange`, `yellow`, `green`, `blue`, `purple`. The
+three must differ. If the feature is enabled and a key is missing or invalid,
+or the state dir is not writable, the YNAB -> Splitwise pass is skipped for
+that user (no writes) and the run exits non-zero.
+
+#### Two-person household example
+
+Purple = 50/50, blue = "Carden pays", green = "Pauline pays". The same colour
+means opposite things in the two budgets, because each person flags only their
+own transactions. Add these keys to each person's entry in
+`MULTI_USER_SECRETS_JSON` (existing keys omitted):
+
+```json
+[
+    {
+        "USER_NAME": "carden",
+        "YNAB_TO_SW_ENABLED": "true",
+        "SW_PARTNER_USER_ID": "<PAULINE_SPLITWISE_USER_ID>",
+        "YNAB_TO_SW_FLAG_SPLIT": "purple",
+        "YNAB_TO_SW_FLAG_PARTNER_PAYS": "green",
+        "YNAB_TO_SW_FLAG_SELF_PAYS": "blue",
+        "YNAB_TO_SW_DRY_RUN": "true"
+    },
+    {
+        "USER_NAME": "pauline",
+        "YNAB_TO_SW_ENABLED": "true",
+        "SW_PARTNER_USER_ID": "<CARDEN_SPLITWISE_USER_ID>",
+        "YNAB_TO_SW_FLAG_SPLIT": "purple",
+        "YNAB_TO_SW_FLAG_PARTNER_PAYS": "blue",
+        "YNAB_TO_SW_FLAG_SELF_PAYS": "green",
+        "YNAB_TO_SW_DRY_RUN": "true"
+    }
+]
+```
+
+To find your partner's Splitwise user id, open them under Friends on
+splitwise.com; the number at the end of the URL (`.../#/friends/<id>`) is
+their id. Start with `YNAB_TO_SW_DRY_RUN` set to `true`. The first run only
+records the baseline. Check the logged counts, then set it to `false`.
+
+In single-user mode the same keys are read from the environment.
+
 ### Cron
 
 The tool will iterate through these values and prefer these to the other secrets that are defined.

@@ -113,5 +113,21 @@ class TestUtils(unittest.TestCase):
         }
         self.assertFalse(check_if_needs_to_update(sw_expense, ynab_transaction))
 
+class TestSplitModeDetails(unittest.TestCase):
+    def test_extract_split_mode(self):
+        from utils import extract_split_mode
+        self.assertEqual(extract_split_mode("ynab:a split:half"), "half")
+        self.assertEqual(extract_split_mode("ynab:a split:partner_pays"), "partner_pays")
+        self.assertIsNone(extract_split_mode("ynab:a"))
+        self.assertIsNone(extract_split_mode(None))
+
+    def test_details_rewrite_keeps_user_text_and_single_marker(self):
+        from utils import details_with_marker_and_mode, extract_ynab_markers
+        out = details_with_marker_and_mode("note from me\nynab:a split:half", "a", "partner_pays")
+        self.assertEqual(out, "note from me\nynab:a split:partner_pays")
+        self.assertEqual(extract_ynab_markers(out), ["a"])
+        self.assertEqual(details_with_marker_and_mode(None, "a", "half"), "ynab:a split:half")
+
+
 if __name__ == '__main__':
     unittest.main()

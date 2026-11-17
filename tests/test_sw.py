@@ -110,6 +110,74 @@ class TestSW(unittest.TestCase):
         # Never really sleep through retry backoff in tests.
         self.sw._sleep = MagicMock()
 
+    def _marker_expense(self, id, details, deleted=None):
+        e = MagicMock()
+        e.getId.return_value = id
+        e.getDetails.return_value = details
+        e.getDeletedAt.return_value = deleted
+        return e
+
+    def test_get_ynab_marker_expense_ids(self):
+        """Marker map pages getExpenses, skips deleted, retries a transient blip."""
+        self.sw.limit = 2
+        page1 = [self._marker_expense(1, "ynab:abc-1"), self._marker_expense(2, None)]
+        page2 = [self._marker_expense(3, "ynab:abc-2", deleted="2026-01-01")]
+        self.mock_splitwise.getExpenses.side_effect = [
+            requests.ConnectionError("blip"), page1, page2, [],
+        ]
+        result = self.sw.get_ynab_marker_expense_ids(dated_after="2026-01-01T00:00:00Z")
+        self.assertEqual(result, {"abc-1": 1})
+        self.assertEqual(self.mock_splitwise.getExpenses.call_count, 4)
+
+    def test_get_expense_404_returns_none(self):
+        from splitwise.exception import SplitwiseNotFoundException
+        self.mock_splitwise.getExpense.side_effect = _sw_error(404, SplitwiseNotFoundException)
+        self.assertIsNone(self.sw.get_expense(5))
+        self.assertEqual(self.mock_splitwise.getExpense.call_count, 1)
+
+    def test_get_expense_retries_transient(self):
+        self.mock_splitwise.getExpense.side_effect = [requests.ConnectionError("blip"), "E"]
+        self.assertEqual(self.sw.get_expense("5"), "E")
+        self.mock_splitwise.getExpense.assert_called_with(5)
+
+    def test_expense_shares_cents(self):
+        u1 = MagicMock(); u1.getId.return_value = "1"
+        u1.getPaidShare.return_value = "10.01"; u1.getOwedShare.return_value = "5.01"
+        u2 = MagicMock(); u2.getId.return_value = 2
+        u2.getPaidShare.return_value = "0.0"; u2.getOwedShare.return_value = "5.0"
+        e = MagicMock(); e.getCost.return_value = "10.01"; e.getUsers.return_value = [u1, u2]
+        self.assertEqual(SW.expense_shares_cents(e), (1001, {1: (1001, 501), 2: (0, 500)}))
+
+    def test_update_expense_sends_id_users_and_details(self):
+        self.mock_splitwise.updateExpense.return_value = (MagicMock(), None)
+        self.sw.update_expense(900, {
+            "cost": "12.00", "date": "2026-01-02T12:00:00Z", "description": "d",
+            "details": "ynab:x split:half",
+            "users": [{"id": 1, "paid": "12.00", "owed": "6.00"},
+                      {"id": 2, "paid": "0.00", "owed": "6.00"}],
+        })
+        self.assertEqual(self.mock_splitwise.updateExpense.call_count, 1)
+        e = self.mock_splitwise.updateExpense.call_args.args[0]
+        self.assertEqual(e.getId(), 900)
+        self.assertEqual(e.getCost(), "12.00")
+        self.assertEqual(e.getDetails(), "ynab:x split:half")
+        self.assertEqual([u.getOwedShare() for u in e.getUsers()], ["6.00", "6.00"])
+
+    def test_create_expense_sets_details_date_and_group(self):
+        self.mock_splitwise.createExpense.return_value = (MagicMock(), None)
+        self.sw.create_expense({
+            "cost": "10.00", "date": "2026-01-02T12:00:00Z", "description": "d",
+            "details": "ynab:x", "group_id": 0,
+            "users": [{"id": 1, "paid": "10.00", "owed": "5.00"},
+                      {"id": 2, "paid": "0.00", "owed": "5.00"}],
+        })
+        self.assertEqual(self.mock_splitwise.createExpense.call_count, 1)
+        e = self.mock_splitwise.createExpense.call_args.args[0]
+        self.assertEqual(e.getDetails(), "ynab:x")
+        self.assertEqual(e.getDate(), "2026-01-02T12:00:00Z")
+        self.assertEqual(e.getGroupId(), 0)
+        self.assertEqual(len(e.getUsers()), 2)
+
     def test_expense_involves_current_user(self):
         """Test _expense_involves_current_user method"""
         # Create a mock expense with current user

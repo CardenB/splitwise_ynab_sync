@@ -102,7 +102,11 @@ class YNABClient:
                     return category['id']
         return None
 
-    def get_transactions(self, budget_id, account_id=None, since_date=None, before_date=None):
+    def get_transactions(self, budget_id, account_id=None, since_date=None, before_date=None,
+                         last_knowledge_of_server=None):
+        """List transactions. With last_knowledge_of_server, YNAB returns only
+        transactions changed since that knowledge (any date); the response's
+        data.server_knowledge is the value to pass next time."""
         endpoint = f"budgets/{budget_id}/transactions"
         if account_id:
             endpoint = f"budgets/{budget_id}/accounts/{account_id}/transactions"
@@ -112,6 +116,8 @@ class YNABClient:
             params['since_date'] = since_date
         if before_date:
             params['before_date'] = before_date
+        if last_knowledge_of_server is not None:
+            params['last_knowledge_of_server'] = last_knowledge_of_server
 
         return self._make_request("GET", endpoint, params=params)
     
