@@ -5,6 +5,7 @@ import logging
 import secrets
 import socket
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
 from typing import Optional
 
@@ -17,6 +18,10 @@ from utils import (
     check_if_needs_to_update,
     combine_names,
     extract_swid_from_memo,
+    append_memo_tag,
+    construct_memo_swexp_tag,
+    construct_ynab_marker,
+    extract_swexp_from_memo,
 )
 
 
@@ -62,6 +67,158 @@ def _add_transaction_to_swid_map(swid_transaction_map: dict, transaction: dict) 
     if sw_id is not None:
         swid_transaction_map[sw_id] = transaction
     return
+
+
+# --- YNAB -> Splitwise (flag-driven) -----------------------------------------
+
+YNAB_FLAG_COLORS = ("red", "orange", "yellow", "green", "blue", "purple")
+# YNAB rejects memos longer than this; the original memo is truncated to fit,
+# never the [SWEXP:<id>] tag.
+YNAB_MEMO_MAX_LENGTH = 200
+SPLIT_MODE_HALF = "half"
+SPLIT_MODE_PARTNER_PAYS = "partner_pays"
+_TRUE_STRINGS = ("true", "1", "yes", "on")
+_FALSE_STRINGS = ("false", "0", "no", "off", "")
+
+
+@dataclass
+class YnabToSwConfig:
+    enabled: bool = False
+    partner_user_id: Optional[int] = None
+    flag_split: str = "purple"
+    flag_partner_pays: Optional[str] = None
+    flag_self_pays: Optional[str] = None
+    lookback_days: int = 14
+    dry_run: bool = False
+
+
+def _config_value(secrets_dict: dict, key: str):
+    """Look a per-user key up in the user's secrets dict.
+
+    Multi-user dicts are lowercased by get_secrets_dict; the single-user
+    fallback passes dict(os.environ), where either case may be used.
+    """
+    for candidate in (key.lower(), key.upper()):
+        if candidate in secrets_dict and secrets_dict[candidate] is not None:
+            return secrets_dict[candidate]
+    return None
+
+
+def _parse_bool(value, key: str, errors: list, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in _TRUE_STRINGS:
+        return True
+    if text in _FALSE_STRINGS:
+        return False
+    errors.append(f"{key} must be true or false")
+    return default
+
+
+def parse_ynab_to_sw_config(secrets_dict: dict):
+    """Parse + validate per-user YNAB -> Splitwise settings.
+
+    Returns (config, errors). errors is only populated when the feature is
+    enabled; a disabled feature never blocks a run.
+    """
+    errors: list = []
+    config = YnabToSwConfig()
+    config.enabled = _parse_bool(
+        _config_value(secrets_dict, "YNAB_TO_SW_ENABLED"), "YNAB_TO_SW_ENABLED", errors, False
+    )
+    config.dry_run = _parse_bool(
+        _config_value(secrets_dict, "YNAB_TO_SW_DRY_RUN"), "YNAB_TO_SW_DRY_RUN", errors, False
+    )
+
+    partner = _config_value(secrets_dict, "SW_PARTNER_USER_ID")
+    if partner is None or str(partner).strip() == "":
+        errors.append("SW_PARTNER_USER_ID is required")
+    else:
+        try:
+            config.partner_user_id = int(str(partner).strip())
+            if config.partner_user_id <= 0:
+                raise ValueError
+        except ValueError:
+            errors.append("SW_PARTNER_USER_ID must be a positive integer Splitwise user id")
+            config.partner_user_id = None
+
+    def _flag(key, default):
+        value = _config_value(secrets_dict, key)
+        if value is None or str(value).strip() == "":
+            return default
+        value = str(value).strip().lower()
+        if value not in YNAB_FLAG_COLORS:
+            errors.append(f"{key} must be one of {', '.join(YNAB_FLAG_COLORS)}")
+        return value
+
+    config.flag_split = _flag("YNAB_TO_SW_FLAG_SPLIT", "purple")
+    config.flag_partner_pays = _flag("YNAB_TO_SW_FLAG_PARTNER_PAYS", None)
+    config.flag_self_pays = _flag("YNAB_TO_SW_FLAG_SELF_PAYS", None)
+    if config.flag_partner_pays is None:
+        errors.append("YNAB_TO_SW_FLAG_PARTNER_PAYS is required")
+    if config.flag_self_pays is None:
+        errors.append("YNAB_TO_SW_FLAG_SELF_PAYS is required")
+    flags = [f for f in (config.flag_split, config.flag_partner_pays, config.flag_self_pays) if f]
+    if len(set(flags)) != len(flags):
+        errors.append("YNAB_TO_SW flag colours must all be different")
+
+    lookback = _config_value(secrets_dict, "YNAB_TO_SW_LOOKBACK_DAYS")
+    if lookback is not None and str(lookback).strip() != "":
+        try:
+            config.lookback_days = int(str(lookback).strip())
+            if config.lookback_days <= 0:
+                raise ValueError
+        except ValueError:
+            errors.append("YNAB_TO_SW_LOOKBACK_DAYS must be a positive integer")
+            config.lookback_days = 14
+
+    if not config.enabled:
+        errors = []
+    return config, errors
+
+
+def _cents_to_str(cents: int) -> str:
+    return f"{cents // 100}.{cents % 100:02d}"
+
+
+def compute_shares(cost_cents: int, mode: str) -> tuple:
+    """Return (owner_owed_cents, partner_owed_cents); they sum to cost_cents.
+
+    Half: partner owes the floor half, so an odd cent stays with the payer.
+    """
+    if mode == SPLIT_MODE_HALF:
+        partner = cost_cents // 2
+    elif mode == SPLIT_MODE_PARTNER_PAYS:
+        partner = cost_cents
+    else:
+        raise ValueError(f"unknown split mode {mode}")
+    return cost_cents - partner, partner
+
+
+def build_splitwise_expense(transaction: dict, mode: str, owner_id, partner_id) -> dict:
+    """Build the sw.create_expense() request for a flagged YNAB outflow."""
+    milliunits = -int(transaction["amount"])
+    if milliunits <= 0 or milliunits % 10 != 0:
+        raise ValueError("amount is not a whole-cent outflow")
+    cost_cents = milliunits // 10
+    owner_owed, partner_owed = compute_shares(cost_cents, mode)
+    # Noon UTC keeps the calendar day stable in any US timezone, and
+    # sw_to_ynab reads the date back as YYYY-MM-DD.
+    date = datetime.strptime(transaction["date"], "%Y-%m-%d").strftime("%Y-%m-%dT12:00:00Z")
+    return {
+        "cost": _cents_to_str(cost_cents),
+        "date": date,
+        "description": (transaction.get("payee_name") or "").strip() or "YNAB transaction",
+        "details": construct_ynab_marker(transaction["id"]),
+        "group_id": 0,
+        "users": [
+            {"id": owner_id, "paid": _cents_to_str(cost_cents), "owed": _cents_to_str(owner_owed)},
+            {"id": partner_id, "paid": _cents_to_str(0), "owed": _cents_to_str(partner_owed)},
+        ],
+    }
 
 
 class ynab_splitwise_transfer:
@@ -389,120 +546,138 @@ class ynab_splitwise_transfer:
             return 1
         return 0
 
-    def ynab_to_sw(self):
-        def extract_names(s):
-            # Make sure we surround "and" with spaces so that we don't replace names with "and" in them
-            s = s.replace(" and ", ",").replace(" ", "")
-            names = s.split(",")
-            return names
+    def ynab_to_sw(self, config: "YnabToSwConfig") -> int:
+        """Flag-driven YNAB -> Splitwise sync. See README "YNAB -> Splitwise".
 
-        def update_ynab(transaction, friends):
-            amount = transaction["amount"]
-            category1_id = transaction[
-                "category_id"
-            ]  # category already classified by the user
-            category1_amount = amount / (len(friends) + 1) * 100
+        For each outflow in this user's budget flagged with an actionable
+        colour, create (or reuse) a Splitwise expense with the partner, then
+        tag the YNAB memo and clear the flag. Returns 0 on success, 1 if any
+        transaction failed (its flag is left in place for the next run).
 
-            category2_id = self.ynab.get_category_id(
-                self.ynab_budget_id, "Splitwise"
-            )  # Splitwise catgeory
-            category2_amount = amount * 100 - category1_amount
-            transaction["subtransactions"] = [
-                {"amount": round(category1_amount / 100), "category_id": category1_id},
-                {"amount": round(category2_amount / 100), "category_id": category2_id},
-            ]
-            transaction["memo"] = "Added to " + transaction["memo"]
-            update_transaction = {"transaction": transaction}
-            self.ynab.update_transaction(
-                self.ynab_budget_id, transaction["id"], update_transaction
-            )
-
-        def update_splitwise(transaction, transaction_friends):
-            amount = transaction["amount"]
-            category1_amount = amount / (len(transaction_friends) + 1) * 100
-            expense_friends_ids = []
-            sw_friends, sw_friends_ids = (
-                self.sw.get_friends()
-            )  # get all friends list from Splitwise
-            for friend in transaction_friends:
-                for sw_friend, friend_id in zip(sw_friends, sw_friends_ids):
-                    if friend.lower() in sw_friend.lower():
-                        expense_friends_ids.append(friend_id)
-
-            total_amount = -amount / 1000
-            expense = {
-                "cost": total_amount,
-                "date": self.end_date.strftime("%Y-%m-%d %H:%M:%S"),
-                "description": transaction["payee_name"],
-                "users": [],
-            }
-            # add current user
-            current_user_owed = -round(category1_amount / 100000, 2)
-            current_user_expense = {
-                "id": self.sw.current_user_id,
-                "owed": current_user_owed,
-                "paid": total_amount,
-            }
-            expense["users"].append(current_user_expense)
-
-            # add friends
-            total_friends_share = 0
-            for i, friend_id in enumerate(expense_friends_ids):
-                if i == len(expense_friends_ids) - 1:
-                    friends_share = (
-                        total_amount - total_friends_share - current_user_owed
-                    )
-                else:
-                    friends_share = round(
-                        (total_amount - current_user_owed) / len(expense_friends_ids), 2
-                    )
-                total_friends_share += friends_share
-                user_expense = {"id": friend_id, "owed": friends_share, "paid": 0}
-                expense["users"].append(user_expense)
-
-            expense, error = self.sw.create_expense(expense)
-            return expense, error
-
-        self.logger.info("Moving transactions from YNAB to Splitwise...")
-        # get all accounts linked
-        accounts = self.ynab.get_accounts(self.ynab_budget_id)
-
-        for account in accounts["data"]["accounts"]:
-            account_id = self.ynab.get_account_id(self.ynab_budget_id, account["name"])
-            # get all transactions in last one day
-            self.logger.info(
-                f"Getting all {account['name']} transactions from {self.ynab_start_date} to {self.end_date}"
-            )
+        Logs carry counts, ids and status only -- never payees, amounts or memos.
+        """
+        log = self.logger
+        modes = {
+            config.flag_split: SPLIT_MODE_HALF,
+            config.flag_partner_pays: SPLIT_MODE_PARTNER_PAYS,
+        }
+        since = datetime.now().date() - timedelta(days=config.lookback_days)
+        log.info(
+            "YNAB->Splitwise: scanning budget since %s (dry_run=%s).",
+            since.isoformat(), config.dry_run,
+        )
+        try:
             response = self.ynab.get_transactions(
-                self.ynab_budget_id,
-                account_id,
-                since_date=self.ynab_start_date,
-                before_date=self.end_date,
+                self.ynab_budget_id, since_date=since.isoformat()
             )
-            for transaction in response["data"]["transactions"]:
-                # check the memo for 'splitwise' keyword
-                if not transaction["memo"]:
+            transactions = response["data"]["transactions"]
+        except Exception as exc:
+            log.error("YNAB->Splitwise: failed to fetch transactions (%s).",
+                      exc.__class__.__name__)
+            return 1
+
+        counts = {"self_pays": 0, "skipped": 0, "already_tagged": 0}
+        candidates = []
+        for transaction in transactions:
+            flag = transaction.get("flag_color")
+            if flag == config.flag_self_pays:
+                counts["self_pays"] += 1
+                continue
+            if flag not in modes:
+                continue
+            if (
+                transaction.get("deleted")
+                or transaction.get("amount", 0) >= 0
+                or transaction.get("transfer_account_id")
+                or transaction.get("subtransactions")
+                or transaction.get("account_id") == self.ynab_account_id
+            ):
+                counts["skipped"] += 1
+                continue
+            memo = transaction.get("memo") or ""
+            if extract_swexp_from_memo(memo) is not None or extract_swid_from_memo(memo)[1] is not None:
+                counts["already_tagged"] += 1
+                continue
+            candidates.append((transaction, modes[flag]))
+
+        log.info(
+            "YNAB->Splitwise: %d candidate(s); ignored %d self-pays, %d ineligible, %d already tagged.",
+            len(candidates), counts["self_pays"], counts["skipped"], counts["already_tagged"],
+        )
+        if not candidates:
+            return 0
+
+        owner_id = self.sw.current_user_id
+        if str(owner_id) == str(config.partner_user_id):
+            log.error("YNAB->Splitwise: partner user id equals the current Splitwise user; aborting.")
+            return 1
+
+        try:
+            # Expense dates are the YNAB transaction date (noon UTC); a day of
+            # margin keeps timezone edges inside the window.
+            dated_after = (since - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+            marker_map = self.sw.get_ynab_marker_expense_ids(dated_after=dated_after)
+        except Exception as exc:
+            log.error("YNAB->Splitwise: failed to read Splitwise expenses (%s); no writes made.",
+                      exc.__class__.__name__)
+            return 1
+
+        created = reused = patched = failed = 0
+        for transaction, mode in candidates:
+            transaction_id = transaction["id"]
+            try:
+                expense_request = build_splitwise_expense(
+                    transaction, mode, owner_id, config.partner_user_id
+                )
+                expense_id = marker_map.get(transaction_id)
+                if config.dry_run:
+                    if expense_id is None:
+                        created += 1
+                    else:
+                        reused += 1
                     continue
-                memo = transaction["memo"].lower()
-                if "splitwise" in memo and not "added to splitwise" in memo:
-                    # transaction_friends = transaction['memo'].split('with')[1].strip()
-                    # Use "with" keyword to imply splitting.
-                    # Handle the case where "with" isn't inside the memo, or friends were not noted properly.
-                    # Also surround 'with' by spaces so that we don't replace names with 'with' in them
-                    memo_split_string = " ".join(
-                        transaction.get("memo", "").split(" with ")[1:]
-                    ).strip()
+                if expense_id is None:
+                    expense, errors = self.sw.create_expense(expense_request)
+                    if errors or expense is None or not expense.getId():
+                        raise RuntimeError("Splitwise rejected the expense")
+                    expense_id = expense.getId()
+                    marker_map[transaction_id] = expense_id
+                    created += 1
+                    log.info("YNAB->Splitwise: transaction %s -> created expense %s.",
+                             transaction_id, expense_id)
+                else:
+                    reused += 1
+                    log.info("YNAB->Splitwise: transaction %s -> reusing expense %s.",
+                             transaction_id, expense_id)
 
-                    transaction_friends = extract_names(memo_split_string)
+                # Only memo + flag_color: never send the whole transaction back.
+                self.ynab.update_transactions(
+                    self.ynab_budget_id,
+                    [{
+                        "id": transaction_id,
+                        "memo": append_memo_tag(
+                            transaction.get("memo"),
+                            construct_memo_swexp_tag(expense_id),
+                            YNAB_MEMO_MAX_LENGTH,
+                        ),
+                        "flag_color": None,
+                    }],
+                )
+                patched += 1
+            except Exception as exc:
+                failed += 1
+                log.error(
+                    "YNAB->Splitwise: transaction %s failed (%s); flag left in place.",
+                    transaction_id, exc.__class__.__name__,
+                )
 
-                    # update Splitwise
-                    expense, error = update_splitwise(transaction, transaction_friends)
-
-                    # update YNAB
-                    if expense and not error:
-                        self.logger.info("Added a transaction on Splitwise")
-                        update_ynab(transaction, transaction_friends)
-                        self.logger.info("Updated YNAB transaction")
+        if config.dry_run:
+            log.info("YNAB->Splitwise DRY RUN: would create %d, would reuse %d; no writes made.",
+                     created, reused)
+        else:
+            log.info("YNAB->Splitwise: created %d, reused %d, YNAB updated %d, failed %d.",
+                     created, reused, patched, failed)
+        return 1 if failed else 0
 
 
 def get_secrets_dict(input_dict: dict) -> dict:
@@ -533,6 +708,13 @@ def run_for_secrets_dict(secrets_dict: dict) -> int:
     use_update_date = os.environ.get("sync_update_date", "false").lower() == "true"
     sync_ynab_to_sw = os.environ.get("sync_ynab_to_sw", "true").lower() == "true"
 
+    # Validate the per-user YNAB -> Splitwise config before touching any API.
+    ynab_to_sw_config, ynab_to_sw_errors = parse_ynab_to_sw_config(secrets_dict)
+    run_ynab_to_sw = sync_ynab_to_sw and ynab_to_sw_config.enabled
+    if run_ynab_to_sw and ynab_to_sw_errors:
+        for error in ynab_to_sw_errors:
+            logging.getLogger(__name__).error("YNAB->Splitwise config error: %s", error)
+
     a = ynab_splitwise_transfer(
         sw_consumer_key,
         sw_consumer_secret,
@@ -545,9 +727,42 @@ def run_for_secrets_dict(secrets_dict: dict) -> int:
 
     # splitwise to ynab
     ret = a.sw_to_ynab()
-    if sync_ynab_to_sw:
-        # ynab to splitwise
-        a.ynab_to_sw()
+    if run_ynab_to_sw:
+        if ynab_to_sw_errors:
+            # Invalid config: skip the YNAB -> Splitwise pass entirely (no writes).
+            ret = 1
+        elif a.ynab_to_sw(ynab_to_sw_config) != 0:
+            ret = 1
+    return ret
+
+
+def run_all_users() -> int:
+    """Run every configured user; one user's failure never stops the others.
+
+    Each user gets a fresh secrets dict and a fresh ynab_splitwise_transfer
+    (no shared per-user state). Returns 1 if any user failed, else 0.
+    """
+    ret = 0
+    if multi_user_secrets := json.loads(
+        os.environ.get("multi_user_secrets_json", "[]")
+    ):
+        for index, user_dict in enumerate(multi_user_secrets):
+            user_dict = get_secrets_dict(user_dict)
+            if not user_dict.get("user_name", ""):
+                continue
+            print(f"Running for user {user_dict['user_name']}")
+            try:
+                cur_ret = run_for_secrets_dict(user_dict)
+            except Exception as exc:
+                logging.getLogger(__name__).error(
+                    "Run for user #%d failed (%s); continuing with the next user.",
+                    index, exc.__class__.__name__,
+                )
+                cur_ret = 1
+            if cur_ret != 0:
+                ret = 1
+    else:
+        ret = run_for_secrets_dict(dict(os.environ))
     return ret
 
 
@@ -561,18 +776,4 @@ if __name__ == "__main__":
     socket.setdefaulttimeout(120)
     # load environment variables from yaml file (locally)
     setup_environment_vars()
-    ret = 0
-    if multi_user_secrets := json.loads(
-        os.environ.get("multi_user_secrets_json", "[]")
-    ):
-        for user_dict in multi_user_secrets:
-            user_dict = get_secrets_dict(user_dict)
-            if not user_dict.get("user_name", ""):
-                continue
-            print(f"Running for user {user_dict['user_name']}")
-            cur_ret = run_for_secrets_dict(user_dict)
-            if cur_ret != 0:
-                ret = 1
-    else:
-        ret = run_for_secrets_dict(dict(os.environ))
-    sys.exit(ret)
+    sys.exit(run_all_users())

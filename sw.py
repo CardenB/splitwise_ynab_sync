@@ -9,7 +9,7 @@ from datetime import datetime
 
 import requests
 
-from utils import construct_memo_swid_tag, setup_environment_vars
+from utils import construct_memo_swid_tag, extract_ynab_markers, setup_environment_vars
 
 # https://github.com/namaggarwal/splitwise
 
@@ -336,11 +336,47 @@ class SW():
             cur_expenses = _fetch_expenses(offset=cur_offset)
         return None
     
+    def get_ynab_marker_expense_ids(self, dated_after, dated_before=None) -> dict:
+        """Map YNAB transaction id -> Splitwise expense id for every non-deleted
+        expense whose `details` carries a `ynab:<transaction id>` marker.
+
+        Pages through getExpenses via the retrying _call_splitwise wrapper.
+        Used by the flag-driven YNAB -> Splitwise path to avoid creating a
+        second expense for a transaction it already handled.
+        """
+        marker_map = {}
+        offset = 0
+        while True:
+            kwargs = dict(limit=self.limit, offset=offset, dated_after=dated_after)
+            if dated_before is not None:
+                kwargs['dated_before'] = dated_before
+            page = self._call_splitwise(
+                f"getExpenses(offset={offset})",
+                lambda: self.sw.getExpenses(**kwargs),
+            )
+            if not page:
+                break
+            for expense in page:
+                if expense.getDeletedAt():
+                    continue
+                for transaction_id in extract_ynab_markers(expense.getDetails()):
+                    marker_map.setdefault(transaction_id, expense.getId())
+            offset += self.limit
+        return marker_map
+
     def create_expense(self, expense):
+        """Create a Splitwise expense. NOT retried: a create is not idempotent.
+
+        Optional keys: 'details' (free-text notes) and 'group_id' (0 = no group).
+        """
         e = Expense()
         e.setCost(expense['cost'])
         e.setDate(expense['date'])
         e.setDescription(expense['description'])
+        if expense.get('details'):
+            e.setDetails(expense['details'])
+        if 'group_id' in expense:
+            e.setGroupId(expense['group_id'])
 
         users = []
         for user in expense['users']:

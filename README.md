@@ -71,6 +71,90 @@ To support multiple users, you can populate key `MULTI_USER_SECRETS_JSON` with a
 ]
 ```
 
+### YNAB -> Splitwise (flag-driven, opt-in)
+
+Each user can push their own shared purchases from YNAB to Splitwise by
+flagging the transaction in **their own budget**. Disabled by default; it
+runs only when the global `sync_ynab_to_sw` env var is `true` (its default)
+**and** that user's `YNAB_TO_SW_ENABLED` is `true`.
+
+Three flag meanings, configured per user:
+
+| Flag key | Meaning | What happens |
+| --- | --- | --- |
+| `YNAB_TO_SW_FLAG_SPLIT` (default `purple`) | 50/50 | You paid in full; partner owes half. An odd cent is owed by you (partner owes the floor half). |
+| `YNAB_TO_SW_FLAG_PARTNER_PAYS` (required) | partner pays | You paid in full; partner owes 100%. |
+| `YNAB_TO_SW_FLAG_SELF_PAYS` (required) | you pay | Nothing. The transaction is ignored and the flag is left in place. |
+
+Each run (hourly), per enabled user:
+
+1. One budget-wide transactions read covering the last `YNAB_TO_SW_LOOKBACK_DAYS`.
+   Only outflows with an actionable flag are considered; inflows, transfers,
+   split (sub)transactions, deleted rows, rows in the Splitwise account, and
+   rows whose memo already has a `[SWEXP:<id>]` or `[SWID:...]` tag are skipped.
+2. Splitwise expenses for the window are read once; any expense whose details
+   contain `ynab:<transaction id>` is reused instead of creating a duplicate.
+3. Otherwise a Splitwise expense is created between you and `SW_PARTNER_USER_ID`:
+   description = payee, date = the YNAB transaction date, details =
+   `ynab:<transaction id>`.
+4. The YNAB transaction is then updated with **only** its memo (original memo +
+   ` [SWEXP:<expense id>]`, the original part truncated if YNAB's memo limit
+   would be exceeded) and a cleared flag. Category, amount and splits are untouched.
+5. If anything fails for a transaction its flag stays, the other transactions
+   still run, and the job exits non-zero. A failure or bad config for one user
+   never stops the other users from running.
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `YNAB_TO_SW_ENABLED` | `false` | Opt-in per user. |
+| `SW_PARTNER_USER_ID` | - | Numeric Splitwise user id of your partner. Required when enabled. |
+| `YNAB_TO_SW_FLAG_SPLIT` | `purple` | |
+| `YNAB_TO_SW_FLAG_PARTNER_PAYS` | - | Required when enabled. |
+| `YNAB_TO_SW_FLAG_SELF_PAYS` | - | Required when enabled. |
+| `YNAB_TO_SW_LOOKBACK_DAYS` | `14` | |
+| `YNAB_TO_SW_DRY_RUN` | `false` | Reads and plans only; logs counts, writes nothing. |
+
+Colours are YNAB's: `red`, `orange`, `yellow`, `green`, `blue`, `purple`; the
+three must differ. Enabled with a missing/invalid key, the YNAB -> Splitwise
+pass is skipped for that user (no writes) and the run exits non-zero.
+
+Two-person household example (purple = 50/50, blue = "Carden pays",
+green = "Pauline pays"). The same colour means opposite things in the two
+budgets, because each person flags only their own transactions. Add these keys
+to each person's entry in `MULTI_USER_SECRETS_JSON` (existing keys omitted):
+
+```json
+[
+    {
+        "USER_NAME": "carden",
+        "YNAB_TO_SW_ENABLED": "true",
+        "SW_PARTNER_USER_ID": "<PAULINE_SPLITWISE_USER_ID>",
+        "YNAB_TO_SW_FLAG_SPLIT": "purple",
+        "YNAB_TO_SW_FLAG_PARTNER_PAYS": "green",
+        "YNAB_TO_SW_FLAG_SELF_PAYS": "blue",
+        "YNAB_TO_SW_LOOKBACK_DAYS": "14",
+        "YNAB_TO_SW_DRY_RUN": "true"
+    },
+    {
+        "USER_NAME": "pauline",
+        "YNAB_TO_SW_ENABLED": "true",
+        "SW_PARTNER_USER_ID": "<CARDEN_SPLITWISE_USER_ID>",
+        "YNAB_TO_SW_FLAG_SPLIT": "purple",
+        "YNAB_TO_SW_FLAG_PARTNER_PAYS": "blue",
+        "YNAB_TO_SW_FLAG_SELF_PAYS": "green",
+        "YNAB_TO_SW_LOOKBACK_DAYS": "14",
+        "YNAB_TO_SW_DRY_RUN": "true"
+    }
+]
+```
+
+Finding your partner's Splitwise user id: on splitwise.com open your partner
+under Friends; the number at the end of the URL (`.../#/friends/<id>`) is it.
+Start with `YNAB_TO_SW_DRY_RUN` = `true`, check the logged counts, then set it
+to `false`.
+
+In single-user mode the same keys are read from the environment.
+
 ### Cron
 
 The tool will iterate through these values and prefer these to the other secrets that are defined.

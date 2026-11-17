@@ -110,6 +110,40 @@ class TestSW(unittest.TestCase):
         # Never really sleep through retry backoff in tests.
         self.sw._sleep = MagicMock()
 
+    def _marker_expense(self, id, details, deleted=None):
+        e = MagicMock()
+        e.getId.return_value = id
+        e.getDetails.return_value = details
+        e.getDeletedAt.return_value = deleted
+        return e
+
+    def test_get_ynab_marker_expense_ids(self):
+        """Marker map pages getExpenses, skips deleted, retries a transient blip."""
+        self.sw.limit = 2
+        page1 = [self._marker_expense(1, "ynab:abc-1"), self._marker_expense(2, None)]
+        page2 = [self._marker_expense(3, "ynab:abc-2", deleted="2026-01-01")]
+        self.mock_splitwise.getExpenses.side_effect = [
+            requests.ConnectionError("blip"), page1, page2, [],
+        ]
+        result = self.sw.get_ynab_marker_expense_ids(dated_after="2026-01-01T00:00:00Z")
+        self.assertEqual(result, {"abc-1": 1})
+        self.assertEqual(self.mock_splitwise.getExpenses.call_count, 4)
+
+    def test_create_expense_sets_details_date_and_group(self):
+        self.mock_splitwise.createExpense.return_value = (MagicMock(), None)
+        self.sw.create_expense({
+            "cost": "10.00", "date": "2026-01-02T12:00:00Z", "description": "d",
+            "details": "ynab:x", "group_id": 0,
+            "users": [{"id": 1, "paid": "10.00", "owed": "5.00"},
+                      {"id": 2, "paid": "0.00", "owed": "5.00"}],
+        })
+        self.assertEqual(self.mock_splitwise.createExpense.call_count, 1)
+        e = self.mock_splitwise.createExpense.call_args.args[0]
+        self.assertEqual(e.getDetails(), "ynab:x")
+        self.assertEqual(e.getDate(), "2026-01-02T12:00:00Z")
+        self.assertEqual(e.getGroupId(), 0)
+        self.assertEqual(len(e.getUsers()), 2)
+
     def test_expense_involves_current_user(self):
         """Test _expense_involves_current_user method"""
         # Create a mock expense with current user
